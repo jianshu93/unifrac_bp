@@ -290,8 +290,11 @@ fn main() -> Result<()> {
     let (taxa, samples, pres) = read_table(tbl_file)?;
     let nsamp = samples.len();
 
-    let t2leaf: HashMap<&str, usize> =
-        leaf_nm.iter().map(|n| (n.as_str(), *n2index(n, &leaf_nm))).collect();
+    let t2leaf: HashMap<&str, usize> = leaf_nm
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.as_str(), i))
+        .collect();
 
     let mut masks: Vec<BitVec<u8, Lsb0>> =
         (0..nsamp).map(|_| BitVec::repeat(false, leaf_ids.len())).collect();
@@ -335,13 +338,4 @@ fn main() -> Result<()> {
 
     /* --- output --------------------------------------------------------- */
     write_matrix(&samples, &dist, nsamp, out_file)
-}
-
-/* helper for leaf-name → index when building the hash-map */
-fn n2index<'a>(name: &'a str, all: &'a [String]) -> &'a usize {
-    all.iter()
-        .position(|s| s == name)
-        .as_ref()
-        .map(|i| unsafe { &*(i as *const usize) })
-        .unwrap()
 }
