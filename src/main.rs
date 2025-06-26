@@ -24,27 +24,35 @@ use succ::{
 type NwkTree = newick::NewickTree;
 
 struct SuccTrav<'a> {
-    t: &'a NwkTree,
-    stack: Vec<(NodeID, usize, usize)>,
-    lens: &'a mut Vec<f32>,                 // indexed by node-id
+    t:     &'a NwkTree,
+    stack: Vec<(NodeID, usize, usize)>,   // (node-id, depth, dummy)
+    lens:  &'a mut Vec<f32>,
 }
 impl<'a> SuccTrav<'a> {
     fn new(t: &'a NwkTree, lens: &'a mut Vec<f32>) -> Self {
         Self { t, stack: vec![(t.root(), 0, 0)], lens }
     }
 }
+
+
 impl<'a> DepthFirstTraverse for SuccTrav<'a> {
     type Label = ();
+
     fn next(&mut self) -> Option<VisitNode<Self::Label>> {
-        let (id, lvl, nth) = self.stack.pop()?;
+        let (id, lvl, _) = self.stack.pop()?;                    // pop
+
+        let n_children = self.t[id].children().len();
         for (k, &c) in self.t[id].children().iter().enumerate().rev() {
-            self.stack.push((c, lvl + 1, k));
+            let nth = n_children - 1 - k;                         // true index
+            self.stack.push((c, lvl + 1, nth));
         }
+
         if self.lens.len() <= id {
             self.lens.resize(id + 1, 0.0);
         }
         self.lens[id] = self.t[id].branch().copied().unwrap_or(0.0);
-        Some(VisitNode::new((), lvl, nth))
+
+        Some(VisitNode::new((), lvl, 0))                         // nth not used
     }
 }
 
