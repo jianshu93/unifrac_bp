@@ -439,7 +439,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "succ"
 version = "0.0.1"
-source = "git+https://github.com/sile/succ#1b0d95a0c9c1d3cb2abf47888b44e80b645b5e83"
+source = "git+https://github.com/jianshu93/succ.git#f8137ec03c43374002309bd1d2724029ea5335c9"
 
 [[package]]
 name = "syn"
@@ -524,6 +524,7 @@ dependencies = [
  "bitvec",
  "clap",
  "env_logger",
+ "log",
  "newick",
  "rayon",
  "succ",
