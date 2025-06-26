@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{BufRead, BufReader, Write},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use newick::{one_from_filename, Newick, NodeID};
@@ -25,6 +25,18 @@ use succ::{
     },
 };
 use succ::tree::Node;
+
+use std::ptr::NonNull;
+
+/// Plain new-type – automatically `Copy`.
+#[derive(Clone, Copy)]
+struct DistPtr(NonNull<f64>);
+
+//  SAFETY: we guarantee in our algorithm that every thread writes a
+//  *disjoint* rectangle of the matrix.  No two threads touch the same
+//  element → pointer can be shared.
+unsafe impl Send for DistPtr {}
+unsafe impl Sync for DistPtr {}
 /* -------------------------------------------------------------------------- */
 /*  Balanced-parentheses construction                                         */
 /* -------------------------------------------------------------------------- */
@@ -148,92 +160,95 @@ fn unifrac_pair(
     if union == 0.0 { 0.0 } else { 1.0 - shared / union }
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Striped algorithm (parallel blocks)                                       */
-/* -------------------------------------------------------------------------- */
-
-const BLK: usize = 128;               // block size (power-of-2 helps cache)
-
 fn unifrac_striped_par(
     post:     &[usize],
     kids:     &[Vec<usize>],
     lens:     &[f32],
     leaf_ids: &[usize],
     masks:    &[BitVec<u8, Lsb0>],
-) -> Vec<f64> {
+) -> Vec<f64>
+{
     let nsamp = masks.len();
     let total = lens.len();
 
-    /* 1) node → samples presence (transposed) -------------------------- */
+    /* --------------------------------------------------- node masks --- */
     let mut node_masks: Vec<BitVec<u8, Lsb0>> =
         (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
 
     for (leaf_pos, &nid) in leaf_ids.iter().enumerate() {
         for (s, sm) in masks.iter().enumerate() {
-            if sm[leaf_pos] {
-                node_masks[nid].set(s, true);
-            }
+            if sm[leaf_pos] { node_masks[nid].set(s, true); }
         }
     }
     for &v in post {
         for &c in &kids[v] {
-            let child_mask  = node_masks[c].clone();
-            node_masks[v]  |= &child_mask;
+            // take a temporary copy — immutable borrow ends right here
+            let child_mask = node_masks[c].clone();
+
+        // now we can mutably borrow node_masks[v] without conflict
+            node_masks[v] |= &child_mask;
         }
     }
 
-    /* 2) distance matrix skeleton ------------------------------------- */
-    let dist   = Arc::new(Mutex::new(vec![0.0f64; nsamp * nsamp]));
-    let nblk   = (nsamp + BLK - 1) / BLK;
+    /* ----------------------------------------- block geometry & jobs --- */
+    let threads   = rayon::current_num_threads().max(1);
+    let est_blk   = ((nsamp as f64 / (2.0 * threads as f64)).sqrt()) as usize;
+    let blk       = est_blk.clamp(64, 512).next_power_of_two();
+    let nblk      = (nsamp + blk - 1) / blk;
 
-    /* 3) parallel over block pairs ------------------------------------ */
-    (0..nblk).into_par_iter().for_each(|bi| {
-        let i0 = bi * BLK;
-        let i1 = (i0 + BLK).min(nsamp);
+    let block_pairs: Vec<(usize, usize)> =
+        (0..nblk).flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj))).collect();
 
-        for bj in bi..nblk {
-            let j0 = bj * BLK;
-            let j1 = (j0 + BLK).min(nsamp);
+    /* --------------------------------------- shared distance matrix --- */
+    let dist   = Arc::new(vec![0.0f64; nsamp * nsamp]);
+    let d_ptr  = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
-            let b_w = i1 - i0;
-            let b_h = j1 - j0;
-            let mut union  = vec![0f64; b_w * b_h];
-            let mut shared = vec![0f64; b_w * b_h];
+    /* ------------------------------------------------ parallel pass ---- */
+    block_pairs.into_par_iter().for_each(move |(bi, bj)| {
+        let d_ptr = d_ptr;                 // copy into the thread
 
-            /* accumulate union/shared for this block pair */
-            for &v in post {
-                let len = lens[v] as f64;
-                let bv  = &node_masks[v];
+        let (i0, i1) = (bi * blk, ((bi + 1) * blk).min(nsamp));
+        let (j0, j1) = (bj * blk, ((bj + 1) * blk).min(nsamp));
 
-                for (ii, i) in (i0..i1).enumerate() {
-                    let a = bv[i];
-                    for (jj, j) in (j0..j1).enumerate() {
-                        if j <= i { continue }           // upper tri only
-                        let b = bv[j];
-                        let idx = ii * b_h + jj;
-                        if a || b { union [idx] += len; }
-                        if a && b { shared[idx] += len; }
-                    }
+        let bw = i1 - i0;
+        let bh = j1 - j0;
+        let mut union  = vec![0.0f64; bw * bh];
+        let mut shared = vec![0.0f64; bw * bh];
+
+        for &v in post {
+            let len = lens[v] as f64;
+            let bv  = &node_masks[v];
+
+            for (ii, i) in (i0..i1).enumerate() {
+                let a = bv[i];
+                for (jj, j) in (j0..j1).enumerate() {
+                    if j <= i { continue; }
+                    let idx = ii * bh + jj;
+                    let b = bv[j];
+                    if a || b { union [idx]  += len; }
+                    if a && b { shared[idx] += len; }
                 }
             }
+        }
 
-            /* convert to distance & write back */
-            let mut dlock = dist.lock().unwrap();
+        /* write back – rectangle is disjoint, so no races */
+        unsafe {
+            let base = d_ptr.0.as_ptr();
             for (ii, i) in (i0..i1).enumerate() {
                 for (jj, j) in (j0..j1).enumerate() {
-                    if j <= i { continue }
-                    let idx_blk = ii * b_h + jj;
-                    let u = union [idx_blk];
-                    let s = shared[idx_blk];
-                    let v = if u == 0.0 { 0.0 } else { 1.0 - s / u };
-                    dlock[i * nsamp + j] = v;
-                    dlock[j * nsamp + i] = v;
+                    if j <= i { continue; }
+                    let idx = ii * bh + jj;
+                    let u = union [idx];
+                    let s = shared[idx];
+                    let d = if u == 0.0 { 0.0 } else { 1.0 - s / u };
+                    *base.add(i * nsamp + j) = d;
+                    *base.add(j * nsamp + i) = d;
                 }
             }
         }
     });
 
-    Arc::into_inner(dist).unwrap().into_inner().unwrap()
+    Arc::try_unwrap(dist).unwrap()
 }
 
 /* -------------------------------------------------------------------------- */
@@ -259,7 +274,12 @@ fn main() -> Result<()> {
     let tree_file = m.get_one::<String>("tree").unwrap();
     let tbl_file  = m.get_one::<String>("input").unwrap();
     let out_file  = m.get_one::<String>("output").unwrap();
+    
 
+    rayon::ThreadPoolBuilder::new()
+    .num_threads(num_cpus::get())   // use every logical core
+    .build_global()
+    .unwrap();
     /* --- tree → balanced parentheses ---------------------------------- */
     let t: NwkTree = one_from_filename(tree_file).context("parse newick")?;
     let mut lens = Vec::<f32>::new();

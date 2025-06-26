@@ -18,3 +18,4 @@ newick   = "0.11"
 bitvec   = "1.0"
 succ     = { git = "https://github.com/jianshu93/succ.git" }  
 log = { version = "0.4" }
+num_cpus = "1"
