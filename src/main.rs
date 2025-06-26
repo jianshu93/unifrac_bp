@@ -101,12 +101,13 @@ fn read_table(p: &str) -> Result<(Vec<String>, Vec<String>, Vec<Vec<f64>>)> {
     let f = File::open(p)?;
     let mut lines = BufReader::new(f).lines();
     let hdr = lines.next().context("empty table")??;
-    let mut it = hdr.split_whitespace(); it.next();
+    let mut it = hdr.split('\t');
+    it.next();
     let samples = it.map(|s| s.to_string()).collect();
     let mut taxa = Vec::new(); let mut mat = Vec::new();
     for l in lines {
         let row = l?;
-        let mut p = row.split_whitespace();
+        let mut p = row.split('\t');
         let tax = p.next().unwrap().to_string();
         let vals = p.map(|v| if v.parse::<f64>().unwrap_or(0.0) > 0.0 {1.0} else {0.0}).collect();
         taxa.push(tax); mat.push(vals);
@@ -184,7 +185,7 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, p: &str) -> Result<()> {
     for s in names { write!(f, "\t{s}")?; } writeln!(f)?;
     for i in 0..n {
         write!(f, "{}", names[i])?;
-        for j in 0..n { write!(f, "\t{:.6}", d[i*n + j])?; }
+        for j in 0..n { write!(f, "\t{:.7}", d[i*n + j])?; }
         writeln!(f)?;
     }
     Ok(())
