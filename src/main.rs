@@ -39,7 +39,7 @@ impl<'a> DepthFirstTraverse for SuccTrav<'a> {
     type Label = ();
 
     fn next(&mut self) -> Option<VisitNode<Self::Label>> {
-        let (id, lvl, _) = self.stack.pop()?;                    // pop
+        let (id, lvl, nth) = self.stack.pop()?;                    // pop
 
         let n_children = self.t[id].children().len();
         for (k, &c) in self.t[id].children().iter().enumerate().rev() {
@@ -52,7 +52,7 @@ impl<'a> DepthFirstTraverse for SuccTrav<'a> {
         }
         self.lens[id] = self.t[id].branch().copied().unwrap_or(0.0);
 
-        Some(VisitNode::new((), lvl, 0))                         // nth not used
+        Some(VisitNode::new((), lvl, nth))                      // nth not used
     }
 }
 
@@ -140,6 +140,9 @@ fn main() -> Result<()> {
     let trav = SuccTrav::new(&t, &mut lens);
     let bp: BalancedParensTree<LabelVec<()>, SparseOneNnd> =
         BalancedParensTree::new_builder(trav, LabelVec::<()>::new()).build_all();
+
+    log::debug!("newick nodes   : {}", t.nodes().count());
+    log::debug!("BP nodes (+1)  : {}", bp.len() + 1);
 
     /* leaves */
     let mut leaf_ids = Vec::<usize>::new();
