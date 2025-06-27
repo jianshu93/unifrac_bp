@@ -28,7 +28,7 @@ use succ::tree::Node;
 
 use std::ptr::NonNull;
 
-/// Plain new-type – automatically `Copy`.
+// Plain new-type – automatically `Copy`.
 #[derive(Clone, Copy)]
 struct DistPtr(NonNull<f64>);
 
@@ -37,9 +37,6 @@ struct DistPtr(NonNull<f64>);
 //  element → pointer can be shared.
 unsafe impl Send for DistPtr {}
 unsafe impl Sync for DistPtr {}
-/* -------------------------------------------------------------------------- */
-/*  Balanced-parentheses construction                                         */
-/* -------------------------------------------------------------------------- */
 
 type NwkTree = newick::NewickTree;
 
@@ -85,10 +82,6 @@ fn collect_children<N: NndOne>(
     post.push(pid);
 }
 
-/* -------------------------------------------------------------------------- */
-/*  OTU table                                                                 */
-/* -------------------------------------------------------------------------- */
-
 fn read_table(p: &str) -> Result<(Vec<String>, Vec<String>, Vec<Vec<f64>>)> {
     let f = File::open(p)?;
     let mut lines = BufReader::new(f).lines();
@@ -127,9 +120,7 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, p: &str) -> Result<()> {
     Ok(())
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Pair-wise algorithm (row-parallel)                                        */
-/* -------------------------------------------------------------------------- */
+//  Pair-wise algorithm
 
 fn unifrac_pair(
     post: &[usize],
@@ -171,7 +162,17 @@ fn unifrac_striped_par(
     let nsamp = masks.len();
     let total = lens.len();
 
-    /* --------------------------------------------------- node masks --- */
+    // node_masks: one mask per node, each mask has `nsamp` bits
+    // node_masks[v][s] is true if sample `s` is present in node `v`
+    // (i.e., sample `s` has at least one leaf in the subtree of `v`)
+    // total number of nodes = total + 1 (root)
+    // (root is at index 0, leaves are at indices 1..total)
+    // each mask is a bit vector of length `nsamp`
+    // (i.e., each sample is represented by a single bit)
+    // we use `BitVec<u8, Lsb0>` to store the masks
+    // (Lsb0 means least significant bit is at index 0)
+    // we use `Vec<BitVec<u8, Lsb0>>` to store all masks
+    // (one mask per node, total + 1 masks)
     let mut node_masks: Vec<BitVec<u8, Lsb0>> =
         (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
 
@@ -190,7 +191,8 @@ fn unifrac_striped_par(
         }
     }
 
-    /* ----------------------------------------- block geometry & jobs --- */
+    // block size and job workload
+    // estimate block size based on number of samples and threads
     let threads   = rayon::current_num_threads().max(1);
     let est_blk   = ((nsamp as f64 / (2.0 * threads as f64)).sqrt()) as usize;
     let blk       = est_blk.clamp(64, 512).next_power_of_two();
@@ -199,13 +201,18 @@ fn unifrac_striped_par(
     let block_pairs: Vec<(usize, usize)> =
         (0..nblk).flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj))).collect();
 
-    /* --------------------------------------- shared distance matrix --- */
+    // share distance matrix across threads
     let dist   = Arc::new(vec![0.0f64; nsamp * nsamp]);
     let d_ptr  = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
-    /* ------------------------------------------------ parallel pass ---- */
+    // rayon parallel iteration over block pairs
+    // each thread will work on a disjoint rectangle of the matrix
+    // (bi, bj) → (i0..i1, j0..j1)
+    // where i0 = bi * blk, i1 = min((bi + 1) * blk, nsamp)
+    // and j0 = bj * blk, j1 = min((bj + 1) * blk, nsamp)
     block_pairs.into_par_iter().for_each(move |(bi, bj)| {
-        let d_ptr = d_ptr;                 // copy into the thread
+        // copy into the thread
+        let d_ptr = d_ptr;                 
 
         let (i0, i1) = (bi * blk, ((bi + 1) * blk).min(nsamp));
         let (j0, j1) = (bj * blk, ((bj + 1) * blk).min(nsamp));
@@ -231,7 +238,7 @@ fn unifrac_striped_par(
             }
         }
 
-        /* write back – rectangle is disjoint, so no races */
+        // write back, rectangle is disjoint, so no races
         unsafe {
             let base = d_ptr.0.as_ptr();
             for (ii, i) in (i0..i1).enumerate() {
@@ -251,22 +258,33 @@ fn unifrac_striped_par(
     Arc::try_unwrap(dist).unwrap()
 }
 
-/* -------------------------------------------------------------------------- */
-/*  Main                                                                      */
-/* -------------------------------------------------------------------------- */
-
 fn main() -> Result<()> {
     env_logger::Builder::from_default_env().init();
 
-    let m = Command::new("unifrac_succ")
-        .arg(Arg::new("tree").short('t').required(true))
-        .arg(Arg::new("input").short('i').required(true))
-        .arg(Arg::new("output").short('o').required(true))
+    let m = Command::new("unifrac-rs")
+        .arg(
+            Arg::new("tree")
+            .short('t')
+            .long("tree")
+            .help("Input tree in Newick format")
+            .required(true))
+        .arg(
+            Arg::new("input")
+            .short('i')
+            .long("input")
+            .help("Input OTU table in TSV format")
+            .required(true))
+        .arg(
+            Arg::new("output")
+            .short('o')
+            .long("output")
+            .help("Output distance matrix in TSV format")
+            .default_value("unifrac.tsv"))
         .arg(
             Arg::new("striped")
-                .long("striped")
-                .help("use striped all-pairs algorithm (parallel blocks)")
-                .action(ArgAction::SetTrue),
+            .long("striped")
+            .help("Use striped UniFrac algorithm")
+            .action(ArgAction::SetTrue),
         )
         .get_matches();
 
@@ -277,10 +295,10 @@ fn main() -> Result<()> {
     
 
     rayon::ThreadPoolBuilder::new()
-    .num_threads(num_cpus::get())   // use every logical core
+    .num_threads(num_cpus::get())   // use every logical core, all threads
     .build_global()
     .unwrap();
-    /* --- tree → balanced parentheses ---------------------------------- */
+    // build tree in balanced parentheses format
     let t: NwkTree = one_from_filename(tree_file).context("parse newick")?;
     let mut lens = Vec::<f32>::new();
     let trav = SuccTrav::new(&t, &mut lens);
@@ -299,14 +317,22 @@ fn main() -> Result<()> {
         }
     }
 
-    /* children + post-order */
+    // children and post-order tranversal
     let total = bp.len() + 1;
     lens.resize(total, 0.0);
     let mut kids = vec![Vec::<usize>::new(); total];
     let mut post = Vec::<usize>::with_capacity(total);
     collect_children::<SparseOneNnd>(&bp.root(), &mut kids, &mut post);
 
-    /* --- OTU table ------------------------------------------------------ */
+    // parsing OTU table
+    // taxa, samples, presence/absence matrix
+    // taxa[i][j] is presence of taxon i in sample j
+    // taxa[i] is the taxon name
+    // samples[j] is the sample name
+    // pres[i][j] is 1 if taxon i is present in sample j
+    // (i.e., has at least one leaf in the subtree of taxon i)
+    // pres[i][j] is 0 if taxon i is absent in sample j
+    // (i.e., has no leaves in the subtree of taxon i)
     let (taxa, samples, pres) = read_table(tbl_file)?;
     let nsamp = samples.len();
 
@@ -329,7 +355,7 @@ fn main() -> Result<()> {
         }
     }
 
-    /* --- UniFrac -------------------------------------------------------- */
+    // pairwise or striped UniFrac interface
     let dist = if striped {
         unifrac_striped_par(&post, &kids, &lens, &leaf_ids, &masks)
     } else {
@@ -355,7 +381,5 @@ fn main() -> Result<()> {
                 acc
             })
     };
-
-    /* --- output --------------------------------------------------------- */
     write_matrix(&samples, &dist, nsamp, out_file)
 }

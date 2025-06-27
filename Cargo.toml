@@ -6,7 +6,7 @@ edition = "2021"
 
 [[bin]]
 
-name = "unifrac-bp"
+name = "unifrac-rs"
 path = "src/main.rs"
 
 [dependencies]

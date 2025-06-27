@@ -1,7 +1,10 @@
 # UniFrac implememtation in Rust
 
 This is an example repo to show how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance between a pair of samples containing taxa. 
-It uses the succint data strucuture to represent a tree so that then the tree is huge, UniFrac computation can still be fast.
+It uses the succint data strucuture to represent a phylogenetic tree so that then the tree is huge, UniFrac computation can still be fast.
+
+Striped UniFrac can also be used via the --striped option to be extremely fast for large number of samples. Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries)
+
 
 ## Install
 ```bash
@@ -13,13 +16,14 @@ cargo build --release
 
 ## Usage 
 ```bash
-Usage: unifrac -t <tree> -i <input> -o <output>
+Usage: unifrac [OPTIONS] --tree <tree> --input <input>
 
 Options:
-  -t <tree>        
-  -i <input>       
-  -o <output>      
-  -h, --help       Print help
+  -t, --tree <tree>      Input tree in Newick format
+  -i, --input <input>    Input OTU table in TSV format
+  -o, --output <output>  Output distance matrix in TSV format [default: unifrac.tsv]
+      --striped          Use striped UniFrac algorithm
+  -h, --help             Print help
 ```
 
 ### example
@@ -27,7 +31,7 @@ Options:
 ### remove bootstrap support first if you have it
 
 ### Then run unifrac like this:
-unifrac_bp -t data/test_rot_new2.nwk -i data/table.txt -o try.txt
+unifrac -t data/test_rot_new2.nwk -i data/table.txt -o try.txt
 cat try.txt
 ```
 
