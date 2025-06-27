@@ -1,8 +1,9 @@
 //! succinct-BP UniFrac  (unweighted)
-//!  * default  – pair-at-a-time, parallel rows
+//!  * default  – pairwise, parallel rows
 //!  * --striped – single post-order pass, **parallel blocks**
 //!      (works for tens-of-thousands samples)
-
+use std::time::Instant;
+use log::info;
 use anyhow::{Context, Result};
 use bitvec::{order::Lsb0, vec::BitVec};
 use clap::{Arg, ArgAction, Command};
@@ -41,9 +42,9 @@ unsafe impl Sync for DistPtr {}
 type NwkTree = newick::NewickTree;
 
 struct SuccTrav<'a> {
-    t:     &'a NwkTree,
+    t: &'a NwkTree,
     stack: Vec<(NodeID, usize, usize)>,
-    lens:  &'a mut Vec<f32>,
+    lens: &'a mut Vec<f32>,
 }
 impl<'a> SuccTrav<'a> {
     fn new(t: &'a NwkTree, lens: &'a mut Vec<f32>) -> Self {
@@ -173,6 +174,8 @@ fn unifrac_striped_par(
     // (Lsb0 means least significant bit is at index 0)
     // we use `Vec<BitVec<u8, Lsb0>>` to store all masks
     // (one mask per node, total + 1 masks)
+
+    let t0 = Instant::now();
     let mut node_masks: Vec<BitVec<u8, Lsb0>> =
         (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
 
@@ -185,31 +188,33 @@ fn unifrac_striped_par(
         for &c in &kids[v] {
             // take a temporary copy — immutable borrow ends right here
             let child_mask = node_masks[c].clone();
-
-        // now we can mutably borrow node_masks[v] without conflict
+            // now we can mutably borrow node_masks[v] without conflict
             node_masks[v] |= &child_mask;
         }
     }
-
+    info!("phase 1  masks built {:>6} ms", t0.elapsed().as_millis());
     // block size and job workload
     // estimate block size based on number of samples and threads
-    let threads   = rayon::current_num_threads().max(1);
-    let est_blk   = ((nsamp as f64 / (2.0 * threads as f64)).sqrt()) as usize;
-    let blk       = est_blk.clamp(64, 512).next_power_of_two();
-    let nblk      = (nsamp + blk - 1) / blk;
+    let threads = rayon::current_num_threads().max(1);
+    let est_blk = ((nsamp as f64 / (2.0 * threads as f64)).sqrt()) as usize;
+    let blk = est_blk.clamp(64, 512).next_power_of_two();
+    let nblk = (nsamp + blk - 1) / blk;
 
+    info!("phase 2 layout: blk={blk}  nblk={nblk}  threads={threads}");
     let block_pairs: Vec<(usize, usize)> =
         (0..nblk).flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj))).collect();
+    info!("phase 2:  {} block-pairs (upper triangle)", block_pairs.len());
 
     // share distance matrix across threads
-    let dist   = Arc::new(vec![0.0f64; nsamp * nsamp]);
-    let d_ptr  = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
+    let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
+    let d_ptr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
     // rayon parallel iteration over block pairs
     // each thread will work on a disjoint rectangle of the matrix
     // (bi, bj) → (i0..i1, j0..j1)
     // where i0 = bi * blk, i1 = min((bi + 1) * blk, nsamp)
     // and j0 = bj * blk, j1 = min((bj + 1) * blk, nsamp)
+    let t3 = Instant::now();
     block_pairs.into_par_iter().for_each(move |(bi, bj)| {
         // copy into the thread
         let d_ptr = d_ptr;                 
@@ -219,7 +224,7 @@ fn unifrac_striped_par(
 
         let bw = i1 - i0;
         let bh = j1 - j0;
-        let mut union  = vec![0.0f64; bw * bh];
+        let mut union = vec![0.0f64; bw * bh];
         let mut shared = vec![0.0f64; bw * bh];
 
         for &v in post {
@@ -254,7 +259,8 @@ fn unifrac_striped_par(
             }
         }
     });
-
+    info!("phase 3 block pass: {:>6} ms", t3.elapsed().as_millis());
+    info!("total striped-UniFrac: {:>6} ms", t0.elapsed().as_millis());
     Arc::try_unwrap(dist).unwrap()
 }
 
@@ -288,16 +294,17 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
-    let striped   = m.get_flag("striped");
+    let striped = m.get_flag("striped");
     let tree_file = m.get_one::<String>("tree").unwrap();
-    let tbl_file  = m.get_one::<String>("input").unwrap();
-    let out_file  = m.get_one::<String>("output").unwrap();
+    let tbl_file = m.get_one::<String>("input").unwrap();
+    let out_file = m.get_one::<String>("output").unwrap();
     
 
     rayon::ThreadPoolBuilder::new()
     .num_threads(num_cpus::get())   // use every logical core, all threads
     .build_global()
     .unwrap();
+
     // build tree in balanced parentheses format
     let t: NwkTree = one_from_filename(tree_file).context("parse newick")?;
     let mut lens = Vec::<f32>::new();
@@ -354,7 +361,6 @@ fn main() -> Result<()> {
             }
         }
     }
-
     // pairwise or striped UniFrac interface
     let dist = if striped {
         unifrac_striped_par(&post, &kids, &lens, &leaf_ids, &masks)
@@ -364,8 +370,7 @@ fn main() -> Result<()> {
             .map(|i| {
                 let mut row = vec![0.0f64; nsamp];
                 for j in i + 1..nsamp {
-                    row[j] = unifrac_pair(
-                        &post, &kids, &lens, &leaf_ids, &masks[i], &masks[j]);
+                    row[j] = unifrac_pair(&post, &kids, &lens, &leaf_ids, &masks[i], &masks[j]);
                 }
                 (i, row)
             })
