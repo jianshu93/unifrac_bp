@@ -3,7 +3,9 @@
 This repo is designed to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance between pairs of samples containing taxa. 
 It uses the succint data strucuture (balanced parenthesis) to represent a phylogenetic tree so that then the tree is huge, UniFrac computation can still be fast.
 
-Striped UniFrac can also be used via the --striped option to be extremely fast for large number of samples. Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries)
+Striped UniFrac can also be used via the --striped option to be extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
+
+Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) for ~20 thousand samples (the largest sample collection we have till today).
 
 
 ## Install
@@ -31,7 +33,7 @@ Options:
 ### remove bootstrap support first if you have it
 
 ### Then run unifrac like this:
-unifrac -t data/test_rot_new2.nwk -i data/table.txt -o try.txt
+unifrac -t data/test.nwk -i data/test_OTU_table.txt  -o try.txt
 cat try.txt
 ```
 
