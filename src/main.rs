@@ -122,7 +122,6 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, p: &str) -> Result<()> {
 }
 
 //  Pair-wise algorithm
-
 fn unifrac_pair(
     post: &[usize],
     kids: &[Vec<usize>],
@@ -130,25 +129,39 @@ fn unifrac_pair(
     leaf_ids: &[usize],
     a: &BitVec<u8, Lsb0>,
     b: &BitVec<u8, Lsb0>,
-) -> f64 {
-    let mut in_a = vec![0u8; lens.len()];
-    let mut in_b = vec![0u8; lens.len()];
-    for (k, &nid) in leaf_ids.iter().enumerate() {
-        if a[k] { in_a[nid] = 1; }
-        if b[k] { in_b[nid] = 1; }
+) -> f64
+{
+    const A_BIT: u8 = 0b01;
+    const B_BIT: u8 = 0b10;
+    //  0 .. total-1
+    let mut mask = vec![0u8; lens.len()];            
+    // leaves
+    for (leaf_pos, &nid) in leaf_ids.iter().enumerate() {
+        if a[leaf_pos] { mask[nid] |= A_BIT; }
+        if b[leaf_pos] { mask[nid] |= B_BIT; }
     }
-    let (mut shared, mut union) = (0.0, 0.0);
+    // internal nodes – post-order ⇒ children processed already
     for &v in post {
         for &c in &kids[v] {
-            in_a[v] |= in_a[c];
-            in_b[v] |= in_b[c];
+            mask[v] |= mask[c];
         }
-        let len = lens[v] as f64;
-        let a1  = in_a[v] == 1;
-        let b1  = in_b[v] == 1;
-        if a1 || b1 { union  += len; }
-        if a1 && b1 { shared += len; }
     }
+
+    // Step 2: accumulate only where at least one present
+    let (mut shared, mut union) = (0.0, 0.0);
+
+    for &v in post {
+        let m = mask[v];
+        // GUARD
+        if m == 0 { continue }                       
+
+        let len = lens[v] as f64;
+        // exactly one present?
+        if m == A_BIT || m == B_BIT { union  += len; }
+        // m == 0b11 
+        else { shared += len; union += len; }
+    }
+
     if union == 0.0 { 0.0 } else { 1.0 - shared / union }
 }
 
@@ -192,6 +205,20 @@ fn unifrac_striped_par(
             node_masks[v] |= &child_mask;
         }
     }
+
+    let words_per_strip = (nsamp + 63) / 64;
+    let node_summ: Vec<Vec<u64>> = node_masks.iter().map(|bv| {
+        bv.as_raw_slice()                                  // &[u8]
+          .chunks(8)
+          .take(words_per_strip)
+          .map(|w| {
+              let mut tmp = [0u8; 8];
+              tmp[..w.len()].copy_from_slice(w);           // pad last word
+              u64::from_le_bytes(tmp)
+          })
+          .collect()
+    }).collect();
+
     info!("phase 1  masks built {:>6} ms", t0.elapsed().as_millis());
     // block size and job workload
     // estimate block size based on number of samples and threads
@@ -228,6 +255,13 @@ fn unifrac_striped_par(
         let mut shared = vec![0.0f64; bw * bh];
 
         for &v in post {
+            // no sample in *either* strip, skip, this can save many space and compute time. Feature tables are very sparse in practice.
+            let wi = (i0 >> 6) as usize;          // == (i0 / 64)
+            let wj = (j0 >> 6) as usize;          // == (j0 / 64)
+            if node_summ[v][wi] == 0 && node_summ[v][wj] == 0 {
+                continue;      // nothing from either strip → skip
+            }
+
             let len = lens[v] as f64;
             let bv  = &node_masks[v];
 
