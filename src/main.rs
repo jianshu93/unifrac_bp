@@ -17,7 +17,7 @@ use std::{
 };
 
 use newick::{one_from_filename, Newick, NodeID};
-use succ::{
+use succparen::{
     bitwise::{ops::NndOne, SparseOneNnd},
     tree::{
         balanced_parens::{BalancedParensTree, Node as BpNode},
@@ -25,7 +25,7 @@ use succ::{
         LabelVec,
     },
 };
-use succ::tree::Node;
+use succparen::tree::Node;
 
 use std::ptr::NonNull;
 
