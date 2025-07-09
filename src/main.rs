@@ -152,7 +152,7 @@ fn unifrac_pair(
 
     for &v in post {
         let m = mask[v];
-        // GUARD
+        // Guard, only taxa showed up in at least one sample wil be used
         if m == 0 { continue }                       
 
         let len = lens[v] as f64;
@@ -165,136 +165,137 @@ fn unifrac_pair(
     if union == 0.0 { 0.0 } else { 1.0 - shared / union }
 }
 
+/// Striped UniFrac (unweighted) with *sparse-node* optimisation.
+/// ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 fn unifrac_striped_par(
-    post:     &[usize],
-    kids:     &[Vec<usize>],
-    lens:     &[f32],
-    leaf_ids: &[usize],
-    masks:    &[BitVec<u8, Lsb0>],
+    post:     &[usize],              // post-order list of *all* internal nodes
+    kids:     &[Vec<usize>],         // children per node  (for completeness – not used here)
+    lens:     &[f32],                // branch length  **f32 → already compact**
+    leaf_ids: &[usize],              // mapping leaf-index → node-id
+    masks:    &[BitVec<u8, Lsb0>],   // presence/absence per sample
 ) -> Vec<f64>
 {
-    let nsamp = masks.len();
-    let total = lens.len();
-
-    // node_masks: one mask per node, each mask has `nsamp` bits
-    // node_masks[v][s] is true if sample `s` is present in node `v`
-    // (i.e., sample `s` has at least one leaf in the subtree of `v`)
-    // total number of nodes = total + 1 (root)
-    // (root is at index 0, leaves are at indices 1..total)
-    // each mask is a bit vector of length `nsamp`
-    // (i.e., each sample is represented by a single bit)
-    // we use `BitVec<u8, Lsb0>` to store the masks
-    // (Lsb0 means least significant bit is at index 0)
-    // we use `Vec<BitVec<u8, Lsb0>>` to store all masks
-    // (one mask per node, total + 1 masks)
-
-    let t0 = Instant::now();
+    /* ─────────────────────  constants & helpers  ───────────────────── */
+    let nsamp   = masks.len();
+    let total   = lens.len();
+    let threads = rayon::current_num_threads().max(1);
     let mut node_masks: Vec<BitVec<u8, Lsb0>> =
         (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
+    /* ─────────── Phase-1: propagate leaf presence up the tree ───────── */
+    let t0 = Instant::now();
 
+    /* leaves – unchanged */
     for (leaf_pos, &nid) in leaf_ids.iter().enumerate() {
         for (s, sm) in masks.iter().enumerate() {
             if sm[leaf_pos] { node_masks[nid].set(s, true); }
         }
     }
+
+    /* internal nodes */
     for &v in post {
+        let mut acc = node_masks[v].clone();      // start with own mask
         for &c in &kids[v] {
-            // take a temporary copy — immutable borrow ends right here
-            let child_mask = node_masks[c].clone();
-            // now we can mutably borrow node_masks[v] without conflict
-            node_masks[v] |= &child_mask;
+            acc |= &node_masks[c];                // immutable borrow finished here
+        }
+        node_masks[v] = acc;                      // single mutable write-back
+    }
+    info!("phase-1 masks built {:>6} ms", t0.elapsed().as_millis());
+
+    /* ─────────── Phase-2: matrix tiling & sparse node lists ─────────── */
+    let est_blk = ((nsamp as f64 / (2.0 * threads as f64)).sqrt()) as usize;
+    let blk     = est_blk.clamp(64, 512).next_power_of_two();     //   64…512  (power-of-2)
+    let nblk    = (nsamp + blk - 1) / blk;                        //   #tiles  per axis
+
+    // build *once* – for every strip (tile-row/col) store nodes that have
+    // *any* sample present in that strip.  Cost:  (#nodes × nblk) bit tests.
+    let mut active_per_strip: Vec<Vec<usize>> = vec![Vec::new(); nblk];
+
+    for v in 0..total {
+        let bits = &node_masks[v];
+        let raw  = bits.as_raw_slice();            // &[u64], little-endian words
+        // iterate strips
+        for bi in 0..nblk {
+            let i0 = bi * blk;
+            let i1 = ((bi + 1) * blk).min(nsamp);
+            // word range covering that strip
+            if bits[i0..i1].any() {          // scans only O(strip-size) bits,
+                active_per_strip[bi].push(v) // but strip ≤ 512 ⇒ negligible cost
+            }
         }
     }
+    // post-order guarantees ascending node id – active lists are already sorted
+    info!("phase-2 sparse lists built ({} strips)", nblk);
 
-    let words_per_strip = (nsamp + 63) / 64;
-    let node_summ: Vec<Vec<u64>> = node_masks.iter().map(|bv| {
-        bv.as_raw_slice()                                  // &[u8]
-          .chunks(8)
-          .take(words_per_strip)
-          .map(|w| {
-              let mut tmp = [0u8; 8];
-              tmp[..w.len()].copy_from_slice(w);           // pad last word
-              u64::from_le_bytes(tmp)
-          })
-          .collect()
-    }).collect();
+    /* ─────────── Phase-3: parallel block sweep (sparse) ─────────────── */
+    let dist   = Arc::new(vec![0.0f64; nsamp * nsamp]);
+    let d_ptr  = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
-    info!("phase 1  masks built {:>6} ms", t0.elapsed().as_millis());
-    // block size and job workload
-    // estimate block size based on number of samples and threads
-    let threads = rayon::current_num_threads().max(1);
-    let est_blk = ((nsamp as f64 / (2.0 * threads as f64)).sqrt()) as usize;
-    let blk = est_blk.clamp(64, 512).next_power_of_two();
-    let nblk = (nsamp + blk - 1) / blk;
-
-    info!("phase 2 layout: blk={blk}  nblk={nblk}  threads={threads}");
-    let block_pairs: Vec<(usize, usize)> =
+    let pairs: Vec<(usize, usize)> =
         (0..nblk).flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj))).collect();
-    info!("phase 2:  {} block-pairs (upper triangle)", block_pairs.len());
 
-    // share distance matrix across threads
-    let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
-    let d_ptr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
-
-    // rayon parallel iteration over block pairs
-    // each thread will work on a disjoint rectangle of the matrix
-    // (bi, bj) → (i0..i1, j0..j1)
-    // where i0 = bi * blk, i1 = min((bi + 1) * blk, nsamp)
-    // and j0 = bj * blk, j1 = min((bj + 1) * blk, nsamp)
     let t3 = Instant::now();
-    block_pairs.into_par_iter().for_each(move |(bi, bj)| {
-        // copy into the thread
-        let d_ptr = d_ptr;                 
-
+    pairs.into_par_iter().for_each(move |(bi, bj)| {
+        /* rectangle coordinates */
+        let d_ptr = d_ptr;  
         let (i0, i1) = (bi * blk, ((bi + 1) * blk).min(nsamp));
         let (j0, j1) = (bj * blk, ((bj + 1) * blk).min(nsamp));
-
         let bw = i1 - i0;
         let bh = j1 - j0;
-        let mut union = vec![0.0f64; bw * bh];
-        let mut shared = vec![0.0f64; bw * bh];
 
-        for &v in post {
-            // no sample in *either* strip, skip, this can save many space and compute time. Feature tables are very sparse in practice.
-            let wi = (i0 >> 6) as usize;          // == (i0 / 64)
-            let wj = (j0 >> 6) as usize;          // == (j0 / 64)
-            if node_summ[v][wi] == 0 && node_summ[v][wj] == 0 {
-                continue;      // nothing from either strip → skip
-            }
+        /* block-local accumulators */
+        let mut union   = vec![0.0f64; bw * bh];
+        let mut shared  = vec![0.0f64; bw * bh];
 
-            let len = lens[v] as f64;
-            let bv  = &node_masks[v];
+        /* merge the two *sorted* active-node lists on the fly */
+        let list_a = &active_per_strip[bi];
+        let list_b = &active_per_strip[bj];
+        let mut ia = 0;
+        let mut ib = 0;
+
+        while ia < list_a.len() || ib < list_b.len() {
+            let v = match (list_a.get(ia), list_b.get(ib)) {
+                (Some(&va), Some(&vb)) => { if va < vb { ia += 1; va }
+                                            else if vb < va { ib += 1; vb }
+                                            else { ia += 1; ib += 1; va } }
+                (Some(&va), None)   => { ia += 1; va },
+                (None,   Some(&vb)) => { ib += 1; vb },
+                _ => unreachable!(),
+            };
+
+            let len  = lens[v] as f64;
+            let bits = &node_masks[v];
 
             for (ii, i) in (i0..i1).enumerate() {
-                let a = bv[i];
+                let a = bits[i];                         // sample-i present?
                 for (jj, j) in (j0..j1).enumerate() {
                     if j <= i { continue; }
+                    let b = bits[j];                     // sample-j present?
+                    if !(a || b) { continue; }           // nothing to add
                     let idx = ii * bh + jj;
-                    let b = bv[j];
-                    if a || b { union [idx]  += len; }
-                    if a && b { shared[idx] += len; }
+                    union [idx]  += len;                 // a ∨ b
+                    if a && b { shared[idx] += len; }    // a ∧ b
                 }
             }
         }
 
-        // write back, rectangle is disjoint, so no races
+        /* write-back (rectangle is disjoint → race-free) */
         unsafe {
             let base = d_ptr.0.as_ptr();
             for (ii, i) in (i0..i1).enumerate() {
                 for (jj, j) in (j0..j1).enumerate() {
                     if j <= i { continue; }
                     let idx = ii * bh + jj;
-                    let u = union [idx];
-                    let s = shared[idx];
-                    let d = if u == 0.0 { 0.0 } else { 1.0 - s / u };
+                    let u   = union [idx];
+                    let s   = shared[idx];
+                    let d   = if u == 0.0 { 0.0 } else { 1.0 - s / u };
                     *base.add(i * nsamp + j) = d;
                     *base.add(j * nsamp + i) = d;
                 }
             }
         }
     });
-    info!("phase 3 block pass: {:>6} ms", t3.elapsed().as_millis());
-    info!("total striped-UniFrac: {:>6} ms", t0.elapsed().as_millis());
+    info!("phase-3 block pass {:>6} ms", t3.elapsed().as_millis());
+
     Arc::try_unwrap(dist).unwrap()
 }
 
