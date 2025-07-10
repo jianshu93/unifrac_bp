@@ -165,88 +165,145 @@ fn unifrac_pair(
     if union == 0.0 { 0.0 } else { 1.0 - shared / union }
 }
 
-/// Striped UniFrac (unweighted) with *sparse-node* optimisation.
-/// ―――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
+/// Striped UniFrac (unweighted)
 fn unifrac_striped_par(
-    post:     &[usize],              // post-order list of *all* internal nodes
-    kids:     &[Vec<usize>],         // children per node  (for completeness – not used here)
-    lens:     &[f32],                // branch length  **f32 → already compact**
-    leaf_ids: &[usize],              // mapping leaf-index → node-id
-    masks:    &[BitVec<u8, Lsb0>],   // presence/absence per sample
+    post:     &[usize],
+    kids:     &[Vec<usize>],
+    lens:     &[f32],
+    leaf_ids: &[usize],
+    masks:    &[BitVec<u8, Lsb0>],
 ) -> Vec<f64>
 {
-    /* ─────────────────────  constants & helpers  ───────────────────── */
-    let nsamp   = masks.len();
-    let total   = lens.len();
-    let threads = rayon::current_num_threads().max(1);
-    let mut node_masks: Vec<BitVec<u8, Lsb0>> =
-        (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
-    /* ─────────── Phase-1: propagate leaf presence up the tree ───────── */
+    /* ─────────── constants ─────────── */
+    let nsamp      = masks.len();
+    let total      = lens.len();
+    let n_threads  = rayon::current_num_threads().max(1);
+
+    let stripe     = (nsamp + n_threads - 1) / n_threads;   // ceil
+    let words_str  = (stripe + 63) >> 6;                    // u64 / stripe
+
+    /* ─────────── node_masks[tid][node][word] ─────────── */
+    let mut node_masks: Vec<Vec<Vec<u64>>> =
+        (0..n_threads)
+            .map(|_| vec![vec![0u64; words_str]; total])
+            .collect();
+
+    /* ================= Phase-1 : build stripes ================= */
     let t0 = Instant::now();
+    rayon::scope(|scope| {
+        for (tid, node_masks_t) in node_masks.iter_mut().enumerate() {
+            let stripe_start = tid * stripe;
+            if stripe_start >= nsamp { break; }          // no samples left
+            let stripe_end   = (stripe_start + stripe).min(nsamp);
+            let masks_slice  = &masks[stripe_start .. stripe_end];
+            let leaf         = leaf_ids;
+            let kids         = kids;
+            let post         = post;
 
-    /* leaves – unchanged */
-    for (leaf_pos, &nid) in leaf_ids.iter().enumerate() {
-        for (s, sm) in masks.iter().enumerate() {
-            if sm[leaf_pos] { node_masks[nid].set(s, true); }
+            scope.spawn(move |_| {
+                /* 1. scatter leaf bits */
+                for (local_s, sm) in masks_slice.iter().enumerate() {
+                    for pos in sm.iter_ones() {
+                        let v = leaf[pos];
+                        let w = local_s >> 6;
+                        let b = local_s & 63;
+                        node_masks_t[v][w] |= 1u64 << b;
+                    }
+                }
+                /* 2. bottom-up OR inside the stripe */
+                for &v in post {
+                    for &c in &kids[v] {
+                        for w in 0..words_str {
+                            node_masks_t[v][w] |= node_masks_t[c][w];
+                        }
+                    }
+                }
+            });
         }
-    }
-
-    /* internal nodes */
-    for &v in post {
-        let mut acc = node_masks[v].clone();      // start with own mask
-        for &c in &kids[v] {
-            acc |= &node_masks[c];                // immutable borrow finished here
-        }
-        node_masks[v] = acc;                      // single mutable write-back
-    }
+    });
     info!("phase-1 masks built {:>6} ms", t0.elapsed().as_millis());
 
-    /* ─────────── Phase-2: matrix tiling & sparse node lists ─────────── */
-    let est_blk = ((nsamp as f64 / (2.0 * threads as f64)).sqrt()) as usize;
-    let blk     = est_blk.clamp(64, 512).next_power_of_two();     //   64…512  (power-of-2)
-    let nblk    = (nsamp + blk - 1) / blk;                        //   #tiles  per axis
+    /* ================= Merge stripes → one BitVec per node ================= */
+    let mut node_bits: Vec<BitVec<u64, Lsb0>> =
+    (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
 
-    // build *once* – for every strip (tile-row/col) store nodes that have
-    // *any* sample present in that strip.  Cost:  (#nodes × nblk) bit tests.
+    node_bits
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(v, bv)| {
+            let dst_words = bv.as_raw_mut_slice();          // &mut [u64]
+            for tid in 0..n_threads {
+                let stripe_start = tid * stripe;
+                let stripe_end   = (stripe_start + stripe).min(nsamp);
+                if stripe_start >= stripe_end { break; }
+
+                let src_words = &node_masks[tid][v];
+                let word_off  = stripe_start >> 6;
+                let bit_off   = (stripe_start & 63) as u32; // 0-63
+
+                let n_src_words = src_words.len();
+                for w in 0..n_src_words {
+                    // mask tail bits (last word of the stripe)
+                    let mut val = src_words[w];
+                    if w == n_src_words - 1 {
+                        let tail_bits = (stripe_end - stripe_start) & 63;
+                        if tail_bits != 0 {
+                            val &= (1u64 << tail_bits) - 1;
+                        }
+                    }
+                    if val == 0 { continue; }
+
+                    // low part
+                    dst_words[word_off + w] |= val << bit_off;
+                    // carry into the next word if mis-aligned
+                    if bit_off != 0 && word_off + w + 1 < dst_words.len() {
+                        dst_words[word_off + w + 1] |= val >> (64 - bit_off);
+                    }
+                }
+            }
+        });
+
+    /* ================= Phase-2 : active nodes per matrix strip ============== */
+    let est_blk = ((nsamp as f64 / (2.0 * n_threads as f64)).sqrt()) as usize;
+    let blk     = est_blk.clamp(64, 512).next_power_of_two();
+    let nblk    = (nsamp + blk - 1) / blk;
+
     let mut active_per_strip: Vec<Vec<usize>> = vec![Vec::new(); nblk];
 
     for v in 0..total {
-        let bits = &node_masks[v];
-        let raw  = bits.as_raw_slice();            // &[u64], little-endian words
-        // iterate strips
+        let raw = node_bits[v].as_raw_slice();   // &[u64]
         for bi in 0..nblk {
             let i0 = bi * blk;
             let i1 = ((bi + 1) * blk).min(nsamp);
-            // word range covering that strip
-            if bits[i0..i1].any() {          // scans only O(strip-size) bits,
-                active_per_strip[bi].push(v) // but strip ≤ 512 ⇒ negligible cost
+            let w0 =  i0        >> 6;
+            let w1 = (i1 + 63)  >> 6;
+            if raw[w0..w1].iter().any(|&w| w != 0) {
+                active_per_strip[bi].push(v);
             }
         }
     }
-    // post-order guarantees ascending node id – active lists are already sorted
     info!("phase-2 sparse lists built ({} strips)", nblk);
 
-    /* ─────────── Phase-3: parallel block sweep (sparse) ─────────────── */
-    let dist   = Arc::new(vec![0.0f64; nsamp * nsamp]);
-    let d_ptr  = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
+    /* ================= Phase-3 : original simple block sweep ================ */
+    let dist  = Arc::new(vec![0.0f64; nsamp * nsamp]);
+    let ptr   = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
     let pairs: Vec<(usize, usize)> =
         (0..nblk).flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj))).collect();
 
     let t3 = Instant::now();
-    pairs.into_par_iter().for_each(move |(bi, bj)| {
-        /* rectangle coordinates */
-        let d_ptr = d_ptr;  
+    pairs.into_par_iter().for_each(|(bi, bj)| {
+        let ptr  = ptr;
         let (i0, i1) = (bi * blk, ((bi + 1) * blk).min(nsamp));
         let (j0, j1) = (bj * blk, ((bj + 1) * blk).min(nsamp));
+
         let bw = i1 - i0;
         let bh = j1 - j0;
+        let words_per_row = (nsamp + 63) >> 6;
 
-        /* block-local accumulators */
-        let mut union   = vec![0.0f64; bw * bh];
-        let mut shared  = vec![0.0f64; bw * bh];
+        let mut union  = vec![0.0f64; bw * bh];
+        let mut shared = vec![0.0f64; bw * bh];
 
-        /* merge the two *sorted* active-node lists on the fly */
         let list_a = &active_per_strip[bi];
         let list_b = &active_per_strip[bj];
         let mut ia = 0;
@@ -254,40 +311,54 @@ fn unifrac_striped_par(
 
         while ia < list_a.len() || ib < list_b.len() {
             let v = match (list_a.get(ia), list_b.get(ib)) {
-                (Some(&va), Some(&vb)) => { if va < vb { ia += 1; va }
-                                            else if vb < va { ib += 1; vb }
-                                            else { ia += 1; ib += 1; va } }
-                (Some(&va), None)   => { ia += 1; va },
-                (None,   Some(&vb)) => { ib += 1; vb },
+                (Some(&va), Some(&vb)) => {
+                    if va < vb { ia += 1; va }
+                    else if vb < va { ib += 1; vb }
+                    else { ia += 1; ib += 1; va }
+                }
+                (Some(&va), None)   => { ia += 1; va }
+                (None,   Some(&vb)) => { ib += 1; vb }
                 _ => unreachable!(),
             };
 
-            let len  = lens[v] as f64;
-            let bits = &node_masks[v];
+            let len    = lens[v] as f64;
+            let words  = node_bits[v].as_raw_slice();          // &[u64]
 
-            for (ii, i) in (i0..i1).enumerate() {
-                let a = bits[i];                         // sample-i present?
-                for (jj, j) in (j0..j1).enumerate() {
-                    if j <= i { continue; }
-                    let b = bits[j];                     // sample-j present?
-                    if !(a || b) { continue; }           // nothing to add
+            for ii in 0..bw {
+                let samp_i = i0 + ii;
+                let word_i = words[samp_i >> 6];
+                let bit_i  = 1u64 << (samp_i & 63);
+                let a_set  = (word_i & bit_i) != 0;
+
+                for jj in 0..bh {
+                    let samp_j = j0 + jj;
+                    if samp_j <= samp_i { continue; }
+
+                    let word_j = words[samp_j >> 6];
+                    let bit_j  = 1u64 << (samp_j & 63);
+                    let b_set  = (word_j & bit_j) != 0;
+
+                    if !a_set && !b_set { continue; }          // nothing here
+
                     let idx = ii * bh + jj;
-                    union [idx]  += len;                 // a ∨ b
-                    if a && b { shared[idx] += len; }    // a ∧ b
+                    union [idx] += len;                         // a ∨ b
+                    if  a_set &&  b_set { shared[idx] += len; } // a ∧ b
                 }
             }
         }
 
-        /* write-back (rectangle is disjoint → race-free) */
+        // ---------- write-back ----------
         unsafe {
-            let base = d_ptr.0.as_ptr();
-            for (ii, i) in (i0..i1).enumerate() {
-                for (jj, j) in (j0..j1).enumerate() {
+            let base = ptr.0.as_ptr();
+            for ii in 0..bw {
+                let i = i0 + ii;
+                for jj in 0..bh {
+                    let j = j0 + jj;
                     if j <= i { continue; }
                     let idx = ii * bh + jj;
-                    let u   = union [idx];
-                    let s   = shared[idx];
-                    let d   = if u == 0.0 { 0.0 } else { 1.0 - s / u };
+                    let u = union[idx];
+                    if u == 0.0 { continue; }
+                    let d = 1.0 - shared[idx] / u;
                     *base.add(i * nsamp + j) = d;
                     *base.add(j * nsamp + i) = d;
                 }
