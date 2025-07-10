@@ -5,7 +5,7 @@ It uses the succint data strucuture (balanced parenthesis) in [succparen](https:
 
 Striped UniFrac can also be used via the --striped option to be extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
 
-Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only) for ~4 thousand samples. I will stop optimizatize here because this crate was developed for metagenomic UniFrac and non-linear UniFrac embedding and we never reach such large scale for metagenomic sampling. 
+Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only) for ~4 thousand samples. I will stop optimizatizing here because this crate was developed for metagenomic UniFrac and non-linear UniFrac embedding and we never reach such large scale for metagenomic sampling. 
 
 
 ## Install
@@ -13,7 +13,7 @@ Right now, the performance matches C++ version of Striped UniFrac in unifrac-bin
 git clone https://github.com/jianshu93/unifrac_bp
 cd unifrac_bp
 
-#### you must have hdf5 installed and library in the path
+#### you must have hdf5 installed and library in the path, cmake and gcc is also required for static compiling of hdf5
 cargo build --release
 ./target/release/unifrac-rs -h
 ```
@@ -43,7 +43,7 @@ cat try.txt
 
 
 ```bash
-#### Striped UniFrac
+#### Striped UniFrac, all logic cores/threads will be used by default
 #### for 4204 microbiome samples with a total of ~0.5 million taxa, it took only ~30s on a M4 Max CPU. 
 #### also ~30s on a Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz CPU with 32 cores
 RUST_LOG=info ./target/release/unifrac-rs -t ./GMTOLsong_table2024_N20_f2all_V4_table.nwk -m ./GMTOLsong_table2024_N20_f2all_V4_table.biom --striped -o GMTOLsong_dist_rs_biom.tsv

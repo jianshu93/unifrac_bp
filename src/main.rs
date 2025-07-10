@@ -244,7 +244,7 @@ fn unifrac_striped_par(
             });
         }
     });
-    info!("phase-1 masks built {:>6} ms", t0.elapsed().as_millis());
+    log::info!("phase-1 masks built {:>6} ms", t0.elapsed().as_millis());
 
     // Merge stripes to one BitVec per node 
     let mut node_bits: Vec<BitVec<u64, Lsb0>> =
@@ -305,7 +305,7 @@ fn unifrac_striped_par(
             }
         }
     }
-    info!("phase-2 sparse lists built ({} strips)", nblk);
+    log::info!("phase-2 sparse lists built ({} strips)", nblk);
 
     // Phase-3 : original simple block sweep
     let dist  = Arc::new(vec![0.0f64; nsamp * nsamp]);
@@ -432,8 +432,12 @@ fn read_biom_csr(p: &str)
 }
 
 fn main() -> Result<()> {
+    println!("\n ************** initializing logger *****************\n");
     env_logger::Builder::from_default_env().init();
+    log::info!("logger initialized from default environment");
     let m = Command::new("unifrac-rs")
+        .version("0.1.0")
+        .about("UniFrac via Succint Data Strucuture (balanced parenthesis)")
         .arg(
             Arg::new("tree")
                 .short('t')
@@ -445,14 +449,14 @@ fn main() -> Result<()> {
             Arg::new("input")      // TSV
                 .short('i')
                 .long("input")
-                .help("OTU table in TSV format")
+                .help("OTU/Feature table in TSV format")
                 .required(false),
         )
         .arg(
             Arg::new("biom")       // BIOM
                 .short('m')
                 .long("biom")
-                .help("OTU table in BIOM (HDF5) format")
+                .help("OTU/Feature table in BIOM (HDF5) format")
                 .required(false),
         )
         .group(
@@ -475,9 +479,9 @@ fn main() -> Result<()> {
         )
         .get_matches();
 
-    let striped   = m.get_flag("striped");
+    let striped = m.get_flag("striped");
     let tree_file = m.get_one::<String>("tree").unwrap();
-    let out_file  = m.get_one::<String>("output").unwrap();
+    let out_file = m.get_one::<String>("output").unwrap();
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus::get())
@@ -486,8 +490,8 @@ fn main() -> Result<()> {
 
     // load tree
     let t: NwkTree = one_from_filename(tree_file).context("parse newick")?;
-    let mut lens  = Vec::<f32>::new();
-    let trav  = SuccTrav::new(&t, &mut lens);
+    let mut lens = Vec::<f32>::new();
+    let trav = SuccTrav::new(&t, &mut lens);
     let bp: BalancedParensTree<LabelVec<()>, SparseOneNnd> =
         BalancedParensTree::new_builder(trav, LabelVec::<()>::new()).build_all();
 
@@ -520,7 +524,7 @@ fn main() -> Result<()> {
     let mut pres = Vec::<Vec<f64>>::new();     // only for TSV
     let mut indptr = Vec::<u32>::new();         // only for BIOM
     let mut indices = Vec::<u32>::new();         // only for BIOM
-    info!("Start parsing input.");
+    log::info!("Start parsing input.");
     if let Some(tsv) = m.get_one::<String>("input") {
         let (t,s,mat) = read_table(tsv)?;
         taxa = t;
@@ -593,7 +597,7 @@ fn main() -> Result<()> {
                 acc
             })
     };
-    info!("Start writing output.");
+    log::info!("Start writing output.");
     // Write output 
     write_matrix(&samples, &dist, nsamp, out_file)
 }
