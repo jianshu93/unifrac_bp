@@ -33,9 +33,7 @@ Options:
 
 ### example
 ```bash
-### remove bootstrap support first if you have it
-
-### Then run unifrac like this:
+### Then run unifrac-rs like this:
 ./target/release/unifrac-rs -t data/test.nwk -i data/test_OTU_table.txt  -o try.txt
 cat try.txt
 ```
@@ -59,7 +57,9 @@ RUST_LOG=info ./target/release/unifrac-rs -t ./GMTOLsong_table2024_N20_f2all_V4_
 ### todo
 
 1.Weighted UniFrac
+
 2.SIMD (another 2-5 times speedup for the block pass phase)
+
 3.GPU offloading
 
 ## References
