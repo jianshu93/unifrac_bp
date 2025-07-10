@@ -107,7 +107,7 @@ fn read_table(p: &str) -> Result<(Vec<String>, Vec<String>, Vec<Vec<f64>>)> {
 }
 
 fn write_matrix(names: &[String], d: &[f64], n: usize, path: &str) -> Result<()> {
-    /* -------- build every line in parallel -------- */
+    // build every line in parallel
     let header = {
         let mut s = String::with_capacity(n * 16);
         s.push_str("Sample");
@@ -132,7 +132,7 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, path: &str) -> Result<()>
         line
     }).collect();
 
-    /* -------- single, large write -------- */
+    // single, large write
     let mut out = BufWriter::with_capacity(16 << 20, File::create(path)?); // 16 MiB buffer
     out.write_all(header.as_bytes())?;
     for line in &mut rows {
@@ -190,41 +190,41 @@ fn unifrac_pair(
 
 /// Striped UniFrac (unweighted)
 fn unifrac_striped_par(
-    post:     &[usize],
-    kids:     &[Vec<usize>],
-    lens:     &[f32],
+    post: &[usize],
+    kids: &[Vec<usize>],
+    lens: &[f32],
     leaf_ids: &[usize],
-    masks:    &[BitVec<u8, Lsb0>],
+    masks: &[BitVec<u8, Lsb0>],
 ) -> Vec<f64>
 {
-    /* ─────────── constants ─────────── */
-    let nsamp      = masks.len();
-    let total      = lens.len();
-    let n_threads  = rayon::current_num_threads().max(1);
+    // constants
+    let nsamp = masks.len();
+    let total = lens.len();
+    let n_threads = rayon::current_num_threads().max(1);
 
-    let stripe     = (nsamp + n_threads - 1) / n_threads;   // ceil
-    let words_str  = (stripe + 63) >> 6;                    // u64 / stripe
+    let stripe = (nsamp + n_threads - 1) / n_threads;   // ceil
+    let words_str = (stripe + 63) >> 6;                    // u64 / stripe
 
-    /* ─────────── node_masks[tid][node][word] ─────────── */
+    // node_masks[tid][node][word]
     let mut node_masks: Vec<Vec<Vec<u64>>> =
         (0..n_threads)
             .map(|_| vec![vec![0u64; words_str]; total])
             .collect();
 
-    /* ================= Phase-1 : build stripes ================= */
+    // Phase-1 : build stripes
     let t0 = Instant::now();
     rayon::scope(|scope| {
         for (tid, node_masks_t) in node_masks.iter_mut().enumerate() {
             let stripe_start = tid * stripe;
             if stripe_start >= nsamp { break; }          // no samples left
-            let stripe_end   = (stripe_start + stripe).min(nsamp);
-            let masks_slice  = &masks[stripe_start .. stripe_end];
-            let leaf         = leaf_ids;
-            let kids         = kids;
-            let post         = post;
+            let stripe_end = (stripe_start + stripe).min(nsamp);
+            let masks_slice = &masks[stripe_start .. stripe_end];
+            let leaf = leaf_ids;
+            let kids = kids;
+            let post = post;
 
             scope.spawn(move |_| {
-                /* 1. scatter leaf bits */
+                // scatter leaf bits
                 for (local_s, sm) in masks_slice.iter().enumerate() {
                     for pos in sm.iter_ones() {
                         let v = leaf[pos];
@@ -233,7 +233,7 @@ fn unifrac_striped_par(
                         node_masks_t[v][w] |= 1u64 << b;
                     }
                 }
-                /* 2. bottom-up OR inside the stripe */
+                // bottom-up OR inside the stripe
                 for &v in post {
                     for &c in &kids[v] {
                         for w in 0..words_str {
@@ -246,7 +246,7 @@ fn unifrac_striped_par(
     });
     info!("phase-1 masks built {:>6} ms", t0.elapsed().as_millis());
 
-    /* ================= Merge stripes → one BitVec per node ================= */
+    // Merge stripes to one BitVec per node 
     let mut node_bits: Vec<BitVec<u64, Lsb0>> =
     (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
 
@@ -286,10 +286,10 @@ fn unifrac_striped_par(
             }
         });
 
-    /* ================= Phase-2 : active nodes per matrix strip ============== */
+    // Phase-2 : active nodes per matrix strip 
     let est_blk = ((nsamp as f64 / (2.0 * n_threads as f64)).sqrt()) as usize;
-    let blk     = est_blk.clamp(64, 512).next_power_of_two();
-    let nblk    = (nsamp + blk - 1) / blk;
+    let blk = est_blk.clamp(64, 512).next_power_of_two();
+    let nblk = (nsamp + blk - 1) / blk;
 
     let mut active_per_strip: Vec<Vec<usize>> = vec![Vec::new(); nblk];
 
@@ -298,8 +298,8 @@ fn unifrac_striped_par(
         for bi in 0..nblk {
             let i0 = bi * blk;
             let i1 = ((bi + 1) * blk).min(nsamp);
-            let w0 =  i0        >> 6;
-            let w1 = (i1 + 63)  >> 6;
+            let w0 =  i0 >> 6;
+            let w1 = (i1 + 63) >> 6;
             if raw[w0..w1].iter().any(|&w| w != 0) {
                 active_per_strip[bi].push(v);
             }
@@ -307,7 +307,7 @@ fn unifrac_striped_par(
     }
     info!("phase-2 sparse lists built ({} strips)", nblk);
 
-    /* ================= Phase-3 : original simple block sweep ================ */
+    // Phase-3 : original simple block sweep
     let dist  = Arc::new(vec![0.0f64; nsamp * nsamp]);
     let ptr   = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
@@ -324,7 +324,7 @@ fn unifrac_striped_par(
         let bh = j1 - j0;
         // let words_per_row = (nsamp + 63) >> 6;
 
-        let mut union  = vec![0.0f64; bw * bh];
+        let mut union = vec![0.0f64; bw * bh];
         let mut shared = vec![0.0f64; bw * bh];
 
         let list_a = &active_per_strip[bi];
@@ -339,27 +339,27 @@ fn unifrac_striped_par(
                     else if vb < va { ib += 1; vb }
                     else { ia += 1; ib += 1; va }
                 }
-                (Some(&va), None)   => { ia += 1; va }
+                (Some(&va), None) => { ia += 1; va }
                 (None,   Some(&vb)) => { ib += 1; vb }
                 _ => unreachable!(),
             };
 
-            let len    = lens[v] as f64;
-            let words  = node_bits[v].as_raw_slice();          // &[u64]
+            let len = lens[v] as f64;
+            let words = node_bits[v].as_raw_slice();          // &[u64]
 
             for ii in 0..bw {
                 let samp_i = i0 + ii;
                 let word_i = words[samp_i >> 6];
-                let bit_i  = 1u64 << (samp_i & 63);
-                let a_set  = (word_i & bit_i) != 0;
+                let bit_i = 1u64 << (samp_i & 63);
+                let a_set = (word_i & bit_i) != 0;
 
                 for jj in 0..bh {
                     let samp_j = j0 + jj;
                     if samp_j <= samp_i { continue; }
 
                     let word_j = words[samp_j >> 6];
-                    let bit_j  = 1u64 << (samp_j & 63);
-                    let b_set  = (word_j & bit_j) != 0;
+                    let bit_j = 1u64 << (samp_j & 63);
+                    let b_set = (word_j & bit_j) != 0;
 
                     if !a_set && !b_set { continue; }          // nothing here
 
@@ -370,7 +370,7 @@ fn unifrac_striped_par(
             }
         }
 
-        // ---------- write-back ----------
+        // write-back 
         unsafe {
             let base = ptr.0.as_ptr();
             for ii in 0..bw {
@@ -399,7 +399,6 @@ fn read_biom_csr(p: &str)
     let f = H5File::open(p)
         .with_context(|| format!("open BIOM file {p}"))?;
 
-    // ----- helpers -------------------------------------------------------
     fn read_utf8(f: &H5File, path: &str) -> Result<Vec<String>> {
         Ok(f.dataset(path)?
              .read_1d::<VarLenUnicode>()?
@@ -411,8 +410,8 @@ fn read_biom_csr(p: &str)
         Ok(f.dataset(path)?.read_raw::<u32>()?.to_vec())
     }
 
-    // ----- required datasets --------------------------------------------
-    let taxa    = read_utf8(&f, "observation/ids")
+    // required datasets
+    let taxa = read_utf8(&f, "observation/ids")
         .context("missing observation/ids")?;
     let samples = read_utf8(&f, "sample/ids")
         .context("missing sample/ids")?;
@@ -426,7 +425,7 @@ fn read_biom_csr(p: &str)
             .with_context(|| format!("missing observation/**/{name}"))
     };
 
-    let indptr  = try_paths("indptr")?;
+    let indptr = try_paths("indptr")?;
     let indices = try_paths("indices")?;
 
     Ok((taxa, samples, indptr, indices))
@@ -480,22 +479,21 @@ fn main() -> Result<()> {
     let tree_file = m.get_one::<String>("tree").unwrap();
     let out_file  = m.get_one::<String>("output").unwrap();
 
-    /* ─────────── Rayon pool ─────────── */
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_cpus::get())
         .build_global()
         .unwrap();
 
-    /* ─────────── Load tree  ─────────── */
+    // load tree
     let t: NwkTree = one_from_filename(tree_file).context("parse newick")?;
-    let mut lens   = Vec::<f32>::new();
-    let trav       = SuccTrav::new(&t, &mut lens);
+    let mut lens  = Vec::<f32>::new();
+    let trav  = SuccTrav::new(&t, &mut lens);
     let bp: BalancedParensTree<LabelVec<()>, SparseOneNnd> =
         BalancedParensTree::new_builder(trav, LabelVec::<()>::new()).build_all();
 
-    /* leaves → mapping taxon-name → leaf-index */
+    // leaves → mapping taxon-name → leaf-index
     let mut leaf_ids = Vec::<usize>::new();
-    let mut leaf_nm  = Vec::<String>::new();
+    let mut leaf_nm = Vec::<String>::new();
     for n in t.nodes() {
         if t[n].is_leaf() {
             leaf_ids.push(n);
@@ -510,27 +508,32 @@ fn main() -> Result<()> {
         .map(|(i, n)| (n.as_str(), i))
         .collect();
 
-    /* children & post-order */
+    // children & post-order
     let total = bp.len() + 1;
     lens.resize(total, 0.0);
     let mut kids = vec![Vec::<usize>::new(); total];
     let mut post = Vec::<usize>::with_capacity(total);
     collect_children::<SparseOneNnd>(&bp.root(), &mut kids, &mut post);
 
-    /* ─────────── Read table (TSV or BIOM) ─────────── */
+    // Read table (TSV or BIOM)
     let (taxa, samples, pres_dense);
-    let mut pres  = Vec::<Vec<f64>>::new();     // only for TSV
+    let mut pres = Vec::<Vec<f64>>::new();     // only for TSV
     let mut indptr = Vec::<u32>::new();         // only for BIOM
-    let mut indices= Vec::<u32>::new();         // only for BIOM
+    let mut indices = Vec::<u32>::new();         // only for BIOM
     info!("Start parsing input.");
     if let Some(tsv) = m.get_one::<String>("input") {
         let (t,s,mat) = read_table(tsv)?;
-        taxa       = t; samples = s; pres = mat;
+        taxa = t;
+        samples = s;
+        pres = mat;
         pres_dense = true;
     } else {
         let biom = m.get_one::<String>("biom").unwrap();
         let (t,s,ip,idx) = read_biom_csr(biom)?;
-        taxa       = t; samples = s; indptr = ip; indices = idx;
+        taxa = t; 
+        samples = s; 
+        indptr = ip;
+        indices = idx;
         pres_dense = false;
     }
     
@@ -539,7 +542,7 @@ fn main() -> Result<()> {
     let mut masks: Vec<BitVec<u8, Lsb0>> =
         (0..nsamp).map(|_| BitVec::repeat(false, leaf_ids.len())).collect();
 
-    /* ─────────── Build masks ─────────── */
+    // Build masks
     if pres_dense {
         for (ti, tax) in taxa.iter().enumerate() {
             if let Some(&leaf) = t2leaf.get(tax.as_str()) {
@@ -553,8 +556,8 @@ fn main() -> Result<()> {
     } else {
         for row in 0..taxa.len() {
             if let Some(&leaf) = t2leaf.get(taxa[row].as_str()) {
-                let start = indptr[row]     as usize;
-                let stop  = indptr[row + 1] as usize;
+                let start = indptr[row] as usize;
+                let stop = indptr[row + 1] as usize;
                 for k in start..stop {
                     let s = indices[k] as usize;
                     masks[s].set(leaf, true);
@@ -563,7 +566,7 @@ fn main() -> Result<()> {
         }
     }
     
-    /* ─────────── Compute UniFrac ─────────── */
+    // Compute UniFrac
     let dist = if striped {
         unifrac_striped_par(&post, &kids, &lens, &leaf_ids, &masks)
     } else {
@@ -591,6 +594,6 @@ fn main() -> Result<()> {
             })
     };
     info!("Start writing output.");
-    /* ─────────── Write output ─────────── */
+    // Write output 
     write_matrix(&samples, &dist, nsamp, out_file)
 }
