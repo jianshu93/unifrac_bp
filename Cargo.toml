@@ -19,5 +19,7 @@ bitvec   = "1.0"
 succparen = "0.0.2"
 log = { version = "0.4" }
 num_cpus = "1"
+hdf5 = { version = "0.8"}
+ryu = "1.0"
 
 

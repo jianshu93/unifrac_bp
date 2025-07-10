@@ -12,10 +12,10 @@ use rayon::prelude::*;
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Write, BufWriter},
     sync::Arc,
 };
-
+use clap::ArgGroup;
 use newick::{one_from_filename, Newick, NodeID};
 use succparen::{
     bitwise::{ops::NndOne, SparseOneNnd},
@@ -26,7 +26,7 @@ use succparen::{
     },
 };
 use succparen::tree::Node;
-
+use hdf5::{File as H5File, types::VarLenUnicode}; 
 use std::ptr::NonNull;
 
 // Plain new-type – automatically `Copy`.
@@ -106,18 +106,41 @@ fn read_table(p: &str) -> Result<(Vec<String>, Vec<String>, Vec<Vec<f64>>)> {
     Ok((taxa, samples, mat))
 }
 
-fn write_matrix(names: &[String], d: &[f64], n: usize, p: &str) -> Result<()> {
-    let mut f = File::create(p)?;
-    write!(f, "Sample")?;
-    for s in names { write!(f, "\t{s}")?; }
-    writeln!(f)?;
-    for i in 0..n {
-        write!(f, "{}", names[i])?;
+fn write_matrix(names: &[String], d: &[f64], n: usize, path: &str) -> Result<()> {
+    /* -------- build every line in parallel -------- */
+    let header = {
+        let mut s = String::with_capacity(n * 16);
+        s.push_str("Sample");
+        for name in names { s.push('\t'); s.push_str(name); }
+        s.push('\n');
+        s
+    };
+
+    // one String per row; share slices of `d`
+    let mut rows: Vec<String> = (0..n).into_par_iter().map(|i| {
+        let mut line = String::with_capacity(n * 12);
+        line.push_str(&names[i]);
+        let base = i * n;
         for j in 0..n {
-            write!(f, "\t{:.7}", d[i * n + j])?;
+            // SAFETY: j in 0..n
+            let val = unsafe { *d.get_unchecked(base + j) };
+            line.push('\t');
+            // fastest stable float→string in std (ryu); no allocation
+            line.push_str(ryu::Buffer::new().format_finite(val));
         }
-        writeln!(f)?;
+        line.push('\n');
+        line
+    }).collect();
+
+    /* -------- single, large write -------- */
+    let mut out = BufWriter::with_capacity(16 << 20, File::create(path)?); // 16 MiB buffer
+    out.write_all(header.as_bytes())?;
+    for line in &mut rows {
+        out.write_all(line.as_bytes())?;
+        // free the row buffer early
+        line.clear();
     }
+    out.flush()?;
     Ok(())
 }
 
@@ -299,7 +322,7 @@ fn unifrac_striped_par(
 
         let bw = i1 - i0;
         let bh = j1 - j0;
-        let words_per_row = (nsamp + 63) >> 6;
+        // let words_per_row = (nsamp + 63) >> 6;
 
         let mut union  = vec![0.0f64; bw * bh];
         let mut shared = vec![0.0f64; bw * bh];
@@ -370,55 +393,107 @@ fn unifrac_striped_par(
     Arc::try_unwrap(dist).unwrap()
 }
 
+fn read_biom_csr(p: &str)
+    -> Result<(Vec<String>, Vec<String>, Vec<u32>, Vec<u32>)>
+{
+    let f = H5File::open(p)
+        .with_context(|| format!("open BIOM file {p}"))?;
+
+    // ----- helpers -------------------------------------------------------
+    fn read_utf8(f: &H5File, path: &str) -> Result<Vec<String>> {
+        Ok(f.dataset(path)?
+             .read_1d::<VarLenUnicode>()?
+             .into_iter()
+             .map(|v| v.as_str().to_owned())
+             .collect())
+    }
+    fn read_u32(f: &H5File, path: &str) -> Result<Vec<u32>> {
+        Ok(f.dataset(path)?.read_raw::<u32>()?.to_vec())
+    }
+
+    // ----- required datasets --------------------------------------------
+    let taxa    = read_utf8(&f, "observation/ids")
+        .context("missing observation/ids")?;
+    let samples = read_utf8(&f, "sample/ids")
+        .context("missing sample/ids")?;
+
+    // CSR arrays may be directly under observation/  (old BIOM 2.0)
+    // or under observation/matrix/  (current spec).  Try the new path
+    // first, fall back to the old one.
+    let try_paths = |name: &str| -> Result<Vec<u32>> {
+        read_u32(&f, &format!("observation/matrix/{name}"))
+            .or_else(|_| read_u32(&f, &format!("observation/{name}")))
+            .with_context(|| format!("missing observation/**/{name}"))
+    };
+
+    let indptr  = try_paths("indptr")?;
+    let indices = try_paths("indices")?;
+
+    Ok((taxa, samples, indptr, indices))
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_default_env().init();
-
     let m = Command::new("unifrac-rs")
         .arg(
             Arg::new("tree")
-            .short('t')
-            .long("tree")
-            .help("Input tree in Newick format")
-            .required(true))
+                .short('t')
+                .long("tree")
+                .help("Input tree in Newick format")
+                .required(true),
+        )
         .arg(
-            Arg::new("input")
-            .short('i')
-            .long("input")
-            .help("Input OTU table in TSV format")
-            .required(true))
+            Arg::new("input")      // TSV
+                .short('i')
+                .long("input")
+                .help("OTU table in TSV format")
+                .required(false),
+        )
+        .arg(
+            Arg::new("biom")       // BIOM
+                .short('m')
+                .long("biom")
+                .help("OTU table in BIOM (HDF5) format")
+                .required(false),
+        )
+        .group(
+            ArgGroup::new("table")
+                .args(["input", "biom"])
+                .required(true),
+        )
         .arg(
             Arg::new("output")
-            .short('o')
-            .long("output")
-            .help("Output distance matrix in TSV format")
-            .default_value("unifrac.tsv"))
+                .short('o')
+                .long("output")
+                .help("Output distance matrix in TSV format")
+                .default_value("unifrac.tsv"),
+        )
         .arg(
             Arg::new("striped")
-            .long("striped")
-            .help("Use striped UniFrac algorithm")
-            .action(ArgAction::SetTrue),
+                .long("striped")
+                .help("Use striped UniFrac algorithm")
+                .action(ArgAction::SetTrue),
         )
         .get_matches();
 
-    let striped = m.get_flag("striped");
+    let striped   = m.get_flag("striped");
     let tree_file = m.get_one::<String>("tree").unwrap();
-    let tbl_file = m.get_one::<String>("input").unwrap();
-    let out_file = m.get_one::<String>("output").unwrap();
-    
+    let out_file  = m.get_one::<String>("output").unwrap();
 
+    /* ─────────── Rayon pool ─────────── */
     rayon::ThreadPoolBuilder::new()
-    .num_threads(num_cpus::get())   // use every logical core, all threads
-    .build_global()
-    .unwrap();
+        .num_threads(num_cpus::get())
+        .build_global()
+        .unwrap();
 
-    // build tree in balanced parentheses format
+    /* ─────────── Load tree  ─────────── */
     let t: NwkTree = one_from_filename(tree_file).context("parse newick")?;
-    let mut lens = Vec::<f32>::new();
-    let trav = SuccTrav::new(&t, &mut lens);
+    let mut lens   = Vec::<f32>::new();
+    let trav       = SuccTrav::new(&t, &mut lens);
     let bp: BalancedParensTree<LabelVec<()>, SparseOneNnd> =
         BalancedParensTree::new_builder(trav, LabelVec::<()>::new()).build_all();
 
-    /* leaves */
+    /* leaves → mapping taxon-name → leaf-index */
     let mut leaf_ids = Vec::<usize>::new();
     let mut leaf_nm  = Vec::<String>::new();
     for n in t.nodes() {
@@ -429,45 +504,66 @@ fn main() -> Result<()> {
             );
         }
     }
-
-    // children and post-order tranversal
-    let total = bp.len() + 1;
-    lens.resize(total, 0.0);
-    let mut kids = vec![Vec::<usize>::new(); total];
-    let mut post = Vec::<usize>::with_capacity(total);
-    collect_children::<SparseOneNnd>(&bp.root(), &mut kids, &mut post);
-
-    // parsing OTU table
-    // taxa, samples, presence/absence matrix
-    // taxa[i][j] is presence of taxon i in sample j
-    // taxa[i] is the taxon name
-    // samples[j] is the sample name
-    // pres[i][j] is 1 if taxon i is present in sample j
-    // (i.e., has at least one leaf in the subtree of taxon i)
-    // pres[i][j] is 0 if taxon i is absent in sample j
-    // (i.e., has no leaves in the subtree of taxon i)
-    let (taxa, samples, pres) = read_table(tbl_file)?;
-    let nsamp = samples.len();
-
     let t2leaf: HashMap<&str, usize> = leaf_nm
         .iter()
         .enumerate()
         .map(|(i, n)| (n.as_str(), i))
         .collect();
 
+    /* children & post-order */
+    let total = bp.len() + 1;
+    lens.resize(total, 0.0);
+    let mut kids = vec![Vec::<usize>::new(); total];
+    let mut post = Vec::<usize>::with_capacity(total);
+    collect_children::<SparseOneNnd>(&bp.root(), &mut kids, &mut post);
+
+    /* ─────────── Read table (TSV or BIOM) ─────────── */
+    let (taxa, samples, pres_dense);
+    let mut pres  = Vec::<Vec<f64>>::new();     // only for TSV
+    let mut indptr = Vec::<u32>::new();         // only for BIOM
+    let mut indices= Vec::<u32>::new();         // only for BIOM
+    info!("Start parsing input.");
+    if let Some(tsv) = m.get_one::<String>("input") {
+        let (t,s,mat) = read_table(tsv)?;
+        taxa       = t; samples = s; pres = mat;
+        pres_dense = true;
+    } else {
+        let biom = m.get_one::<String>("biom").unwrap();
+        let (t,s,ip,idx) = read_biom_csr(biom)?;
+        taxa       = t; samples = s; indptr = ip; indices = idx;
+        pres_dense = false;
+    }
+    
+
+    let nsamp = samples.len();
     let mut masks: Vec<BitVec<u8, Lsb0>> =
         (0..nsamp).map(|_| BitVec::repeat(false, leaf_ids.len())).collect();
 
-    for (ti, tax) in taxa.iter().enumerate() {
-        if let Some(&leaf) = t2leaf.get(tax.as_str()) {
-            for (s, bits) in masks.iter_mut().enumerate() {
-                if pres[ti][s] > 0.0 {
-                    bits.set(leaf, true);
+    /* ─────────── Build masks ─────────── */
+    if pres_dense {
+        for (ti, tax) in taxa.iter().enumerate() {
+            if let Some(&leaf) = t2leaf.get(tax.as_str()) {
+                for (s, bits) in masks.iter_mut().enumerate() {
+                    if pres[ti][s] > 0.0 {
+                        bits.set(leaf, true);
+                    }
+                }
+            }
+        }
+    } else {
+        for row in 0..taxa.len() {
+            if let Some(&leaf) = t2leaf.get(taxa[row].as_str()) {
+                let start = indptr[row]     as usize;
+                let stop  = indptr[row + 1] as usize;
+                for k in start..stop {
+                    let s = indices[k] as usize;
+                    masks[s].set(leaf, true);
                 }
             }
         }
     }
-    // pairwise or striped UniFrac interface
+    
+    /* ─────────── Compute UniFrac ─────────── */
     let dist = if striped {
         unifrac_striped_par(&post, &kids, &lens, &leaf_ids, &masks)
     } else {
@@ -476,7 +572,9 @@ fn main() -> Result<()> {
             .map(|i| {
                 let mut row = vec![0.0f64; nsamp];
                 for j in i + 1..nsamp {
-                    row[j] = unifrac_pair(&post, &kids, &lens, &leaf_ids, &masks[i], &masks[j]);
+                    row[j] = unifrac_pair(
+                        &post, &kids, &lens, &leaf_ids, &masks[i], &masks[j],
+                    );
                 }
                 (i, row)
             })
@@ -492,5 +590,7 @@ fn main() -> Result<()> {
                 acc
             })
     };
+    info!("Start writing output.");
+    /* ─────────── Write output ─────────── */
     write_matrix(&samples, &dist, nsamp, out_file)
 }
