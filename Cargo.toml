@@ -5,7 +5,8 @@ authors = ["jianshuzhao@yahoo.com"]
 repository = "https://github.com/jianshu93/unifrac_bp.git"
 keywords = ["unifrac", "phylogenetic", "bacteria"]
 edition = "2024"
-
+license = "MIT OR Apache-2.0"
+description = "UniFrac distance for comparing microbiomes using balanced parenthesis"
 
 [[bin]]
 
