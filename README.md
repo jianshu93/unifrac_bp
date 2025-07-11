@@ -15,12 +15,12 @@ cd unifrac_bp
 
 #### you must have hdf5 installed and library in the path, cmake and gcc is also required for static compiling of hdf5
 cargo build --release
-./target/release/unifrac-rs -h
+./target/release/unifrac -h
 ```
 
 ## Usage 
 ```bash
-Usage: unifrac-rs [OPTIONS] --tree <tree> <--input <input>|--biom <biom>>
+Usage: unifrac [OPTIONS] --tree <tree> <--input <input>|--biom <biom>>
 
 Options:
   -t, --tree <tree>      Input tree in Newick format
@@ -34,7 +34,7 @@ Options:
 ### example
 ```bash
 ### Then run unifrac-rs like this:
-./target/release/unifrac-rs -t data/test.nwk -i data/test_OTU_table.txt  -o try.txt
+./target/release/unifrac -t data/test.nwk -i data/test_OTU_table.txt  -o try.txt
 cat try.txt
 ```
 
@@ -46,7 +46,7 @@ cat try.txt
 #### Striped UniFrac, all logic cores/threads will be used by default
 #### for 4204 microbiome samples with a total of ~0.5 million taxa, it took only ~30s on a M4 Max CPU. 
 #### also ~30s on a Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz CPU with 32 cores
-RUST_LOG=info ./target/release/unifrac-rs -t ./GMTOLsong_table2024_N20_f2all_V4_table.nwk -m ./GMTOLsong_table2024_N20_f2all_V4_table.biom --striped -o GMTOLsong_dist_rs_biom.tsv
+RUST_LOG=info ./target/release/unifrac -t ./GMTOLsong_table2024_N20_f2all_V4_table.nwk -m ./GMTOLsong_table2024_N20_f2all_V4_table.biom --striped -o GMTOLsong_dist_rs_biom.tsv
 [2025-07-10T05:27:14Z INFO  unifrac_rs] Start parsing input.
 [2025-07-10T05:27:14Z INFO  unifrac_rs] phase-1 masks built     40 ms
 [2025-07-10T05:27:14Z INFO  unifrac_rs] phase-2 sparse lists built (66 strips)

@@ -126,6 +126,7 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, path: &str) -> Result<()>
             let val = unsafe { *d.get_unchecked(base + j) };
             line.push('\t');
             // fastest stable float→string in std (ryu); no allocation
+            // Ulf Adams. 2018. Ryū: fast float-to-string conversion. In Proceedings of the 39th ACM SIGPLAN Conference on Programming Language Design and Implementation (PLDI 2018). Association for Computing Machinery, New York, NY, USA, 270–282. https://doi.org/10.1145/3192366.3192369
             line.push_str(ryu::Buffer::new().format_finite(val));
         }
         line.push('\n');
@@ -446,14 +447,14 @@ fn main() -> Result<()> {
                 .required(true),
         )
         .arg(
-            Arg::new("input")      // TSV
+            Arg::new("input")
                 .short('i')
                 .long("input")
                 .help("OTU/Feature table in TSV format")
                 .required(false),
         )
         .arg(
-            Arg::new("biom")       // BIOM
+            Arg::new("biom") 
                 .short('m')
                 .long("biom")
                 .help("OTU/Feature table in BIOM (HDF5) format")
