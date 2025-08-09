@@ -189,6 +189,37 @@ fn unifrac_pair(
     if union == 0.0 { 0.0 } else { 1.0 - shared / union }
 }
 
+// help function in unifrac_par_stripd_par to count relevant branches
+fn log_relevant_branch_counts_from_bits(node_bits: &[bitvec::vec::BitVec<u64, Lsb0>],
+                                        lens: &[f32]) {
+    // assumes caller checked log level
+    let total = lens.len();
+    if node_bits.is_empty() { return; }
+    let nsamp = node_bits[0].len();
+
+    // only positive-length edges count as “branches”
+    let total_branches = lens.iter().filter(|&&l| l > 0.0).count();
+    let mut rel_counts = vec![0u32; nsamp];
+
+    for v in 0..total {
+        if lens[v] <= 0.0 { continue; }
+        let words = node_bits[v].as_raw_slice(); // &[u64], bit s set ⇒ sample s covers node v
+        for (wi, &w0) in words.iter().enumerate() {
+            let mut w = w0;
+            while w != 0 {
+                let b = w.trailing_zeros() as usize;    // next set bit in this word
+                let s = (wi << 6) + b;                  // sample index
+                if s < nsamp { rel_counts[s] += 1; }
+                w &= w - 1;                              // clear lowest set bit
+            }
+        }
+    }
+
+    for s in 0..nsamp {
+        log::info!("sample {}: relevant branches = {} / {}",
+                   s, rel_counts[s], total_branches);
+    }
+}
 /// Striped UniFrac (unweighted)
 fn unifrac_striped_par(
     post: &[usize],
@@ -286,7 +317,10 @@ fn unifrac_striped_par(
                 }
             }
         });
-
+    // extract relevant branches and count how many for testing purposes
+    if log::log_enabled!(log::Level::Info) {
+        log_relevant_branch_counts_from_bits(&node_bits, lens);
+    }
     // Phase-2 : active nodes per matrix strip 
     let est_blk = ((nsamp as f64 / (2.0 * n_threads as f64)).sqrt()) as usize;
     let blk = est_blk.clamp(64, 512).next_power_of_two();
@@ -519,7 +553,12 @@ fn main() -> Result<()> {
     let mut kids = vec![Vec::<usize>::new(); total];
     let mut post = Vec::<usize>::with_capacity(total);
     collect_children::<SparseOneNnd>(&bp.root(), &mut kids, &mut post);
+    log::info!("Total branches with positive length: {}", lens.iter().filter(|&&l| l > 0.0).count());
 
+    let mut node2leaf = vec![usize::MAX; total];
+    for (leaf_pos, &nid) in leaf_ids.iter().enumerate() {
+        node2leaf[nid] = leaf_pos;
+    }
     // Read table (TSV or BIOM)
     let (taxa, samples, pres_dense);
     let mut pres = Vec::<Vec<f64>>::new();     // only for TSV
