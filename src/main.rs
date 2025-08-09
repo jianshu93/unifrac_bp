@@ -190,8 +190,7 @@ fn unifrac_pair(
 }
 
 // help function in unifrac_par_stripd_par to count relevant branches
-fn log_relevant_branch_counts_from_bits(node_bits: &[bitvec::vec::BitVec<u64, Lsb0>],
-                                        lens: &[f32]) {
+fn log_relevant_branch_counts_from_bits(node_bits: &[bitvec::vec::BitVec<u64, Lsb0>], lens: &[f32]) {
     // assumes caller checked log level
     let total = lens.len();
     if node_bits.is_empty() { return; }
@@ -203,7 +202,7 @@ fn log_relevant_branch_counts_from_bits(node_bits: &[bitvec::vec::BitVec<u64, Ls
 
     for v in 0..total {
         if lens[v] <= 0.0 { continue; }
-        let words = node_bits[v].as_raw_slice(); // &[u64], bit s set ⇒ sample s covers node v
+        let words = node_bits[v].as_raw_slice(); // &[u64], bit s set sample s covers node v
         for (wi, &w0) in words.iter().enumerate() {
             let mut w = w0;
             while w != 0 {
