@@ -51,7 +51,7 @@ cat try.txt
 #### Striped UniFrac, all logic cores/threads will be used by default
 #### for 4204 microbiome samples with a total of ~0.5 million taxa, it took only ~30s on a M4 Max CPU. 
 #### also ~30s on a Intel(R) Xeon(R) Gold 6338 CPU @ 2.00GHz CPU with 32 cores
-RUST_LOG=info ./target/release/unifrac -t ./GMTOLsong_table2024_N20_f2all_V4_table.nwk -m ./GMTOLsong_table2024_N20_f2all_V4_table.biom --striped -o GMTOLsong_dist_rs_biom.tsv
+RUST_LOG=info ./target/release/unifrac -t ./GMTOLsong_table2024_N20_f2all_V4_table.nwk -m ./GMTOLsong_table2024_N20_f2all_V4_table.biom -o GMTOLsong_dist_rs_biom.tsv
 [2025-07-10T05:27:14Z INFO  unifrac_rs] Start parsing input.
 [2025-07-10T05:27:14Z INFO  unifrac_rs] phase-1 masks built     40 ms
 [2025-07-10T05:27:14Z INFO  unifrac_rs] phase-2 sparse lists built (66 strips)
