@@ -1,12 +1,12 @@
 [package]
 name = "unifrac_rs"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["jianshuzhao@yahoo.com"]
 repository = "https://github.com/jianshu93/unifrac_bp.git"
-keywords = ["unifrac", "phylogenetic", "bacteria"]
+keywords = ["unifrac", "phylogenetic", "bacteria", "succint"]
 edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "UniFrac distance for comparing microbiomes using balanced parenthesis"
+description = "Striped UniFrac for comparing microbiomes using optimal balanced parenthesis"
 
 [[bin]]
 

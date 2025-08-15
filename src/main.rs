@@ -1,5 +1,4 @@
 //! succinct-BP UniFrac  (unweighted)
-//!  * default  – pairwise, parallel rows
 //!  * --striped – single post-order pass, **parallel blocks**
 //!      (works for tens-of-thousands samples)
 use std::time::Instant;
@@ -33,7 +32,7 @@ use std::ptr::NonNull;
 #[derive(Clone, Copy)]
 struct DistPtr(NonNull<f64>);
 
-//  SAFETY: we guarantee in our algorithm that every thread writes a
+//  we guarantee in the algorithm that every thread writes a
 //  *disjoint* rectangle of the matrix.  No two threads touch the same
 //  element → pointer can be shared.
 unsafe impl Send for DistPtr {}
@@ -470,8 +469,8 @@ fn main() -> Result<()> {
     env_logger::Builder::from_default_env().init();
     log::info!("logger initialized from default environment");
     let m = Command::new("unifrac-rs")
-        .version("0.1.0")
-        .about("UniFrac via Succint Data Strucuture (balanced parenthesis)")
+        .version("0.1.1")
+        .about("Striped UniFrac via Optimal Balanced Parenthesis")
         .arg(
             Arg::new("tree")
                 .short('t')
@@ -505,15 +504,8 @@ fn main() -> Result<()> {
                 .help("Output distance matrix in TSV format")
                 .default_value("unifrac.tsv"),
         )
-        .arg(
-            Arg::new("striped")
-                .long("striped")
-                .help("Use striped UniFrac algorithm")
-                .action(ArgAction::SetTrue),
-        )
         .get_matches();
 
-    let striped = m.get_flag("striped");
     let tree_file = m.get_one::<String>("tree").unwrap();
     let out_file = m.get_one::<String>("output").unwrap();
 
@@ -610,32 +602,8 @@ fn main() -> Result<()> {
     }
     
     // Compute UniFrac
-    let dist = if striped {
-        unifrac_striped_par(&post, &kids, &lens, &leaf_ids, &masks)
-    } else {
-        (0..nsamp)
-            .into_par_iter()
-            .map(|i| {
-                let mut row = vec![0.0f64; nsamp];
-                for j in i + 1..nsamp {
-                    row[j] = unifrac_pair(
-                        &post, &kids, &lens, &leaf_ids, &masks[i], &masks[j],
-                    );
-                }
-                (i, row)
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .fold(vec![0.0f64; nsamp * nsamp], |mut acc, (i, row)| {
-                for (j, &v) in row.iter().enumerate() {
-                    if v != 0.0 {
-                        acc[i * nsamp + j] = v;
-                        acc[j * nsamp + i] = v;
-                    }
-                }
-                acc
-            })
-    };
+    let dist = unifrac_striped_par(&post, &kids, &lens, &leaf_ids, &masks);
+
     log::info!("Start writing output.");
     // Write output 
     write_matrix(&samples, &dist, nsamp, out_file)
