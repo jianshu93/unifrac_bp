@@ -5,7 +5,7 @@ use std::time::Instant;
 use log::info;
 use anyhow::{Context, Result};
 use bitvec::{order::Lsb0, vec::BitVec};
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, Command};
 use env_logger;
 use rayon::prelude::*;
 use std::{
@@ -142,50 +142,6 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, path: &str) -> Result<()>
     }
     out.flush()?;
     Ok(())
-}
-
-//  Pair-wise algorithm
-fn unifrac_pair(
-    post: &[usize],
-    kids: &[Vec<usize>],
-    lens: &[f32],
-    leaf_ids: &[usize],
-    a: &BitVec<u8, Lsb0>,
-    b: &BitVec<u8, Lsb0>,
-) -> f64
-{
-    const A_BIT: u8 = 0b01;
-    const B_BIT: u8 = 0b10;
-    //  0 .. total-1
-    let mut mask = vec![0u8; lens.len()];            
-    // leaves
-    for (leaf_pos, &nid) in leaf_ids.iter().enumerate() {
-        if a[leaf_pos] { mask[nid] |= A_BIT; }
-        if b[leaf_pos] { mask[nid] |= B_BIT; }
-    }
-    // internal nodes – post-order ⇒ children processed already
-    for &v in post {
-        for &c in &kids[v] {
-            mask[v] |= mask[c];
-        }
-    }
-
-    // Step 2: accumulate only where at least one present
-    let (mut shared, mut union) = (0.0, 0.0);
-
-    for &v in post {
-        let m = mask[v];
-        // Guard, only taxa showed up in at least one sample wil be used
-        if m == 0 { continue }                       
-
-        let len = lens[v] as f64;
-        // exactly one present?
-        if m == A_BIT || m == B_BIT { union  += len; }
-        // m == 0b11 
-        else { shared += len; union += len; }
-    }
-
-    if union == 0.0 { 0.0 } else { 1.0 - shared / union }
 }
 
 // help function in unifrac_par_stripd_par to count relevant branches

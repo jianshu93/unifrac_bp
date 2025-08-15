@@ -3,7 +3,7 @@
 This repo shows how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance between pairs of samples containing taxa. 
 It uses the succint data strucuture (balanced parenthesis) in [succparen](https://github.com/sile/succparen.git) crate to represent a phylogenetic tree so that then the tree is huge, UniFrac computation can still be fast.
 
-Striped UniFrac can also be used via the --striped option to be extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
+Striped UniFrac is the default algorithm and it is extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
 
 Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only) for ~4 thousand samples. I will stop optimizatizing here because this crate was developed for metagenomic UniFrac and non-linear UniFrac embedding and we never reach such large scale for metagenomic sampling. 
 
@@ -20,15 +20,20 @@ cargo build --release
 
 ## Usage 
 ```bash
+
+ ************** initializing logger *****************
+
+Striped UniFrac via Optimal Balanced Parenthesis
+
 Usage: unifrac [OPTIONS] --tree <tree> <--input <input>|--biom <biom>>
 
 Options:
   -t, --tree <tree>      Input tree in Newick format
-  -i, --input <input>    OTU table in TSV format
-  -m, --biom <biom>      OTU table in BIOM (HDF5) format
+  -i, --input <input>    OTU/Feature table in TSV format
+  -m, --biom <biom>      OTU/Feature table in BIOM (HDF5) format
   -o, --output <output>  Output distance matrix in TSV format [default: unifrac.tsv]
-      --striped          Use striped UniFrac algorithm
   -h, --help             Print help
+  -V, --version          Print version
 ```
 
 ### example
