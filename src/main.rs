@@ -1,3 +1,6 @@
+// =====================================================
+// Striped UniFrac (exact, succinct-BP) — drop empty samples and continue
+// =====================================================
 //! succinct-BP UniFrac  (unweighted)
 //!  * --striped – single post-order pass, **parallel blocks**
 //!      (works for tens-of-thousands samples)
