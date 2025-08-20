@@ -140,7 +140,7 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, path: &str) -> Result<()>
     // header
     let header = {
         let mut s = String::with_capacity(n * 16);
-        s.push_str("Sample");
+        s.push_str("");
         for name in names { s.push('\t'); s.push_str(name); }
         s.push('\n');
         s
