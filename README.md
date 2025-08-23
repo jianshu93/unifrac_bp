@@ -59,6 +59,28 @@ RUST_LOG=info ./target/release/unifrac -t ./GMTOLsong_table2024_N20_f2all_V4_tab
 [2025-07-10T05:27:46Z INFO  unifrac_rs] Start writing output.
 ```
 
+For 50,000 samples on a 64-core AMD CPU. The performance matches that of C++ unifrac-binaries.
+```bash
+$unifrac -t ./ag_emp.tre -m ./ag_emp_even500.biom -o emp_50k_dist_rust.tsv
+
+ ************** initializing logger *****************
+
+real	12m17.507s
+user	1486m0.383s
+sys	3m17.306s
+
+
+$time ssu -t ./ag_emp.tre -i ag_emp_even500.biom -o emp_50k_dist_c++.tsv -m unweighted
+
+real
+13m43.239s
+user
+108m10.510s
+sys
+0m50.950s
+
+```
+
 ### todo
 
 1.Weighted UniFrac
