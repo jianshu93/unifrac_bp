@@ -1,3 +1,11 @@
+ //! BSD 3-Clause License
+ //!
+ //! Copyright (c) 2016-2025, UniFrac development team.
+ //! All rights reserved.
+ //!
+ //! See LICENSE file for more details
+
+
 //! succinct-BP UniFrac  (unweighted)
 //!  * --striped – single post-order pass, **parallel blocks**
 //!      (works for tens-of-thousands samples)
@@ -234,12 +242,13 @@ fn log_relevant_branch_counts_from_bits(node_bits: &[bitvec::vec::BitVec<u64, Ls
     }
 }
 /// Striped UniFrac (unweighted)
+/// Striped UniFrac (unweighted) — masks owned so we can free them right after Phase-1.
 fn unifrac_striped_par(
     post: &[usize],
     kids: &[Vec<usize>],
     lens: &[f32],
     leaf_ids: &[usize],
-    masks: &[BitVec<u8, Lsb0>],
+    mut masks: Vec<BitVec<u8, Lsb0>>,   // <-- take ownership
 ) -> Vec<f64>
 {
     // constants
@@ -247,8 +256,9 @@ fn unifrac_striped_par(
     let total = lens.len();
     let n_threads = rayon::current_num_threads().max(1);
 
+    // Partition samples into stripes by thread
     let stripe = (nsamp + n_threads - 1) / n_threads;   // ceil
-    let words_str = (stripe + 63) >> 6;                    // u64 / stripe
+    let words_str = (stripe + 63) >> 6;                 // u64s per stripe
 
     // node_masks[tid][node][word]
     let mut node_masks: Vec<Vec<Vec<u64>>> =
@@ -256,14 +266,20 @@ fn unifrac_striped_par(
             .map(|_| vec![vec![0u64; words_str]; total])
             .collect();
 
+    // -------------------------
     // Phase-1 : build stripes
+    // -------------------------
     let t0 = Instant::now();
     rayon::scope(|scope| {
         for (tid, node_masks_t) in node_masks.iter_mut().enumerate() {
             let stripe_start = tid * stripe;
             if stripe_start >= nsamp { break; }          // no samples left
             let stripe_end = (stripe_start + stripe).min(nsamp);
+
+            // Slice of masks for this stripe
             let masks_slice = &masks[stripe_start .. stripe_end];
+
+            // Borrowed tree scaffolding
             let leaf = leaf_ids;
             let kids = kids;
             let post = post;
@@ -291,9 +307,16 @@ fn unifrac_striped_par(
     });
     log::info!("phase-1 masks built {:>6} ms", t0.elapsed().as_millis());
 
-    // Merge stripes to one BitVec per node 
+    // We no longer need per-sample leaf masks after scattering into stripes.
+    // This can reclaim a LOT of memory for millions of leaves / thousands of samples.
+    masks.clear();
+    masks.shrink_to_fit();
+
+    // -----------------------------------------------
+    // Merge stripes into one BitVec per node (node_bits)
+    // -----------------------------------------------
     let mut node_bits: Vec<BitVec<u64, Lsb0>> =
-    (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
+        (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
 
     node_bits
         .par_iter_mut()
@@ -330,11 +353,18 @@ fn unifrac_striped_par(
                 }
             }
         });
-    // extract relevant branches and count how many for testing purposes
+
+    // The per-stripe scratch is no longer needed after merge.
+    drop(node_masks);
+
+    // (Optional) instrumentation
     if log::log_enabled!(log::Level::Info) {
         log_relevant_branch_counts_from_bits(&node_bits, lens);
     }
-    // Phase-2 : active nodes per matrix strip 
+
+    // -----------------------------------------
+    // Phase-2 : active nodes per matrix strip
+    // -----------------------------------------
     let est_blk = ((nsamp as f64 / (2.0 * n_threads as f64)).sqrt()) as usize;
     let blk = est_blk.clamp(64, 512).next_power_of_two();
     let nblk = (nsamp + blk - 1) / blk;
@@ -355,7 +385,9 @@ fn unifrac_striped_par(
     }
     log::info!("phase-2 sparse lists built ({} strips)", nblk);
 
-    // Phase-3 : original simple block sweep
+    // -----------------------------------------
+    // Phase-3 : block sweep (upper triangle)
+    // -----------------------------------------
     let dist  = Arc::new(vec![0.0f64; nsamp * nsamp]);
     let ptr   = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
@@ -370,7 +402,6 @@ fn unifrac_striped_par(
 
         let bw = i1 - i0;
         let bh = j1 - j0;
-        // let words_per_row = (nsamp + 63) >> 6;
 
         let mut union = vec![0.0f64; bw * bh];
         let mut shared = vec![0.0f64; bw * bh];
@@ -436,6 +467,11 @@ fn unifrac_striped_par(
             }
         }
     });
+
+    // Free big working sets ASAP before logging
+    drop(active_per_strip);
+    drop(node_bits);
+
     info!("phase-3 block pass {:>6} ms", t3.elapsed().as_millis());
 
     Arc::try_unwrap(dist).unwrap()
@@ -484,7 +520,7 @@ fn main() -> Result<()> {
     env_logger::Builder::from_default_env().init();
     log::info!("logger initialized from default environment");
     let m = Command::new("unifrac-rs")
-        .version("0.2.0")
+        .version("0.2.1")
         .about("Striped UniFrac via Optimal Balanced Parenthesis")
         .arg(
             Arg::new("tree")
@@ -554,7 +590,7 @@ fn main() -> Result<()> {
         .enumerate()
         .map(|(i, n)| (n.as_str(), i))
         .collect();
-
+    drop(t);
     // children & post-order
     let total = bp.len() + 1;
     lens.resize(total, 0.0);
@@ -567,8 +603,9 @@ fn main() -> Result<()> {
     for (leaf_pos, &nid) in leaf_ids.iter().enumerate() {
         node2leaf[nid] = leaf_pos;
     }
+    drop(node2leaf);
     // Read table (TSV or BIOM)
-    let (taxa, samples, pres_dense);
+    let (mut taxa, samples, pres_dense);
     let mut pres = Vec::<Vec<f64>>::new();     // only for TSV
     let mut indptr = Vec::<u32>::new();         // only for BIOM
     let mut indices = Vec::<u32>::new();         // only for BIOM
@@ -617,9 +654,25 @@ fn main() -> Result<()> {
             }
         }
     }
-    
+    drop(t2leaf);
+    leaf_nm.clear();
+    leaf_nm.shrink_to_fit();
+    taxa.clear();
+    taxa.shrink_to_fit();
+    pres.clear();
+    pres.shrink_to_fit(); 
+    indptr.clear(); 
+    indptr.shrink_to_fit();
+    indices.clear();
+    indices.shrink_to_fit();
     // Compute UniFrac
-    let dist = unifrac_striped_par(&post, &kids, &lens, &leaf_ids, &masks);
+    let dist = unifrac_striped_par(&post, &kids, &lens, &leaf_ids, masks);
+
+    drop(kids);
+    drop(post);
+    drop(leaf_ids);
+    lens.clear();
+    lens.shrink_to_fit();
 
     log::info!("Start writing output.");
     // Write output 
