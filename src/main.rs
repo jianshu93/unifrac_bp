@@ -1,40 +1,40 @@
- //! BSD 3-Clause License
- //!
- //! Copyright (c) 2016-2025, UniFrac development team.
- //! All rights reserved.
- //!
- //! See LICENSE file for more details
-
+//! BSD 3-Clause License
+//!
+//! Copyright (c) 2016-2025, UniFrac development team.
+//! All rights reserved.
+//!
+//! See LICENSE file for more details
 
 //! succinct-BP UniFrac  (unweighted)
 //!  * --striped – single post-order pass, **parallel blocks**
 //!      (works for tens-of-thousands samples)
-use std::time::Instant;
-use log::info;
 use anyhow::{Context, Result};
 use bitvec::{order::Lsb0, vec::BitVec};
+use clap::ArgGroup;
 use clap::{Arg, Command};
+use clap::ArgAction;
 use env_logger;
+use hdf5::{File as H5File, types::VarLenUnicode};
+use log::info;
+use newick::{Newick, NodeID, one_from_string};
 use rayon::prelude::*;
+use std::ptr::NonNull;
+use std::time::Instant;
 use std::{
     collections::HashMap,
     fs::File,
-    io::{BufRead, BufReader, Write, BufWriter},
+    io::{BufRead, BufReader, BufWriter, Write},
     sync::Arc,
 };
-use clap::ArgGroup;
-use newick::{one_from_string, Newick, NodeID};
+use succparen::tree::Node;
 use succparen::{
-    bitwise::{ops::NndOne, SparseOneNnd},
+    bitwise::{SparseOneNnd, ops::NndOne},
     tree::{
+        LabelVec,
         balanced_parens::{BalancedParensTree, Node as BpNode},
         traversal::{DepthFirstTraverse, VisitNode},
-        LabelVec,
     },
 };
-use succparen::tree::Node;
-use hdf5::{File as H5File, types::VarLenUnicode}; 
-use std::ptr::NonNull;
 
 // Plain new-type – automatically `Copy`.
 #[derive(Clone, Copy)]
@@ -48,7 +48,7 @@ unsafe impl Sync for DistPtr {}
 
 type NwkTree = newick::NewickTree;
 
-// Tree traversal to collect branch lengths 
+// Tree traversal to collect branch lengths
 fn sanitize_newick_drop_internal_labels_and_comments(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(bytes.len());
@@ -75,15 +75,23 @@ fn sanitize_newick_drop_internal_labels_and_comments(s: &str) -> String {
                 i += 1;
 
                 // Skip whitespace
-                while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
 
                 // Optional internal label right after ')': quoted or unquoted.
                 if i < bytes.len() && bytes[i] == b'\'' {
                     // Quoted label — skip it
                     i += 1;
                     while i < bytes.len() {
-                        if bytes[i] == b'\\' && i + 1 < bytes.len() { i += 2; continue; }
-                        if bytes[i] == b'\'' { i += 1; break; }
+                        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i] == b'\'' {
+                            i += 1;
+                            break;
+                        }
                         i += 1;
                     }
                     // (comments after this will be removed by the '[' arm next loop)
@@ -91,7 +99,11 @@ fn sanitize_newick_drop_internal_labels_and_comments(s: &str) -> String {
                     // Unquoted run until a delimiter
                     while i < bytes.len() {
                         let c = bytes[i];
-                        if c.is_ascii_whitespace() || matches!(c, b':'|b','|b')'|b'('|b';'|b'[') { break; }
+                        if c.is_ascii_whitespace()
+                            || matches!(c, b':' | b',' | b')' | b'(' | b';' | b'[')
+                        {
+                            break;
+                        }
                         i += 1;
                     }
                 }
@@ -114,7 +126,11 @@ struct SuccTrav<'a> {
 }
 impl<'a> SuccTrav<'a> {
     fn new(t: &'a NwkTree, lens: &'a mut Vec<f32>) -> Self {
-        Self { t, stack: vec![(t.root(), 0, 0)], lens }
+        Self {
+            t,
+            stack: vec![(t.root(), 0, 0)],
+            lens,
+        }
     }
 }
 impl<'a> DepthFirstTraverse for SuccTrav<'a> {
@@ -158,14 +174,42 @@ fn read_table(p: &str) -> Result<(Vec<String>, Vec<String>, Vec<Vec<f64>>)> {
     let samples = it.map(|s| s.to_owned()).collect();
 
     let mut taxa = Vec::new();
-    let mut mat  = Vec::new();
+    let mut mat = Vec::new();
     for l in lines {
         let row = l?;
         let mut p = row.split('\t');
         let tax = p.next().unwrap().to_owned();
         let vals = p
-            .map(|v| if v.parse::<f64>().unwrap_or(0.0) > 0.0 { 1.0 } else { 0.0 })
+            .map(|v| {
+                if v.parse::<f64>().unwrap_or(0.0) > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
             .collect();
+        taxa.push(tax);
+        mat.push(vals);
+    }
+    Ok((taxa, samples, mat))
+}
+// read table with weights
+fn read_table_counts(p: &str) -> Result<(Vec<String>, Vec<String>, Vec<Vec<f64>>)> {
+    let f = File::open(p)?;
+    let mut lines = BufReader::new(f).lines();
+    let hdr = lines.next().context("empty table")??;
+
+    let mut it = hdr.split('\t');
+    it.next(); // skip leading label
+    let samples: Vec<String> = it.map(|s| s.to_owned()).collect();
+
+    let mut taxa = Vec::new();
+    let mut mat = Vec::new();
+    for l in lines {
+        let row = l?;
+        let mut p = row.split('\t');
+        let tax = p.next().unwrap().to_owned();
+        let vals = p.map(|v| v.parse::<f64>().unwrap_or(0.0)).collect::<Vec<f64>>();
         taxa.push(tax);
         mat.push(vals);
     }
@@ -177,27 +221,33 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, path: &str) -> Result<()>
     let header = {
         let mut s = String::with_capacity(n * 16);
         s.push_str("Sample");
-        for name in names { s.push('\t'); s.push_str(name); }
+        for name in names {
+            s.push('\t');
+            s.push_str(name);
+        }
         s.push('\n');
         s
     };
 
     // one String per row; share slices of `d`
-    let mut rows: Vec<String> = (0..n).into_par_iter().map(|i| {
-        let mut line = String::with_capacity(n * 12);
-        line.push_str(&names[i]);
-        let base = i * n;
-        for j in 0..n {
-            // SAFETY: j in 0..n
-            let val = unsafe { *d.get_unchecked(base + j) };
-            line.push('\t');
-            // fastest stable float→string in std (ryu); no allocation
-            // Ulf Adams. 2018. Ryū: fast float-to-string conversion. In Proceedings of the 39th ACM SIGPLAN Conference on Programming Language Design and Implementation (PLDI 2018). Association for Computing Machinery, New York, NY, USA, 270–282. https://doi.org/10.1145/3192366.3192369
-            line.push_str(ryu::Buffer::new().format_finite(val));
-        }
-        line.push('\n');
-        line
-    }).collect();
+    let mut rows: Vec<String> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut line = String::with_capacity(n * 12);
+            line.push_str(&names[i]);
+            let base = i * n;
+            for j in 0..n {
+                // SAFETY: j in 0..n
+                let val = unsafe { *d.get_unchecked(base + j) };
+                line.push('\t');
+                // fastest stable float→string in std (ryu); no allocation
+                // Ulf Adams. 2018. Ryū: fast float-to-string conversion. In Proceedings of the 39th ACM SIGPLAN Conference on Programming Language Design and Implementation (PLDI 2018). Association for Computing Machinery, New York, NY, USA, 270–282. https://doi.org/10.1145/3192366.3192369
+                line.push_str(ryu::Buffer::new().format_finite(val));
+            }
+            line.push('\n');
+            line
+        })
+        .collect();
 
     // single, large write
     let mut out = BufWriter::with_capacity(16 << 20, File::create(path)?); // 16 MiB buffer
@@ -212,10 +262,15 @@ fn write_matrix(names: &[String], d: &[f64], n: usize, path: &str) -> Result<()>
 }
 
 // help function in unifrac_par_stripd_par to count relevant branches
-fn log_relevant_branch_counts_from_bits(node_bits: &[bitvec::vec::BitVec<u64, Lsb0>], lens: &[f32]) {
+fn log_relevant_branch_counts_from_bits(
+    node_bits: &[bitvec::vec::BitVec<u64, Lsb0>],
+    lens: &[f32],
+) {
     // assumes caller checked log level
     let total = lens.len();
-    if node_bits.is_empty() { return; }
+    if node_bits.is_empty() {
+        return;
+    }
     let nsamp = node_bits[0].len();
 
     // only positive-length edges count as “branches”
@@ -223,15 +278,19 @@ fn log_relevant_branch_counts_from_bits(node_bits: &[bitvec::vec::BitVec<u64, Ls
     let mut rel_counts = vec![0u32; nsamp];
 
     for v in 0..total {
-        if lens[v] <= 0.0 { continue; }
+        if lens[v] <= 0.0 {
+            continue;
+        }
         let words = node_bits[v].as_raw_slice(); // &[u64], bit s set sample s covers node v
         for (wi, &w0) in words.iter().enumerate() {
             let mut w = w0;
             while w != 0 {
-                let b = w.trailing_zeros() as usize;    // next set bit in this word
-                let s = (wi << 6) + b;                  // sample index
-                if s < nsamp { rel_counts[s] += 1; }
-                w &= w - 1;                              // clear lowest set bit
+                let b = w.trailing_zeros() as usize; // next set bit in this word
+                let s = (wi << 6) + b; // sample index
+                if s < nsamp {
+                    rel_counts[s] += 1;
+                }
+                w &= w - 1; // clear lowest set bit
             }
         }
     }
@@ -239,8 +298,13 @@ fn log_relevant_branch_counts_from_bits(node_bits: &[bitvec::vec::BitVec<u64, Ls
     for s in 0..nsamp {
         let cnt = rel_counts[s] as usize;
         let frac = (cnt as f64) / (total_branches as f64);
-        log::info!("sample {}: relevant branches = {} / {} = {}",
-                   s, rel_counts[s], total_branches, frac);
+        log::info!(
+            "sample {}: relevant branches = {} / {} = {}",
+            s,
+            rel_counts[s],
+            total_branches,
+            frac
+        );
     }
 }
 /// Striped UniFrac (unweighted)
@@ -250,23 +314,21 @@ fn unifrac_striped_par(
     kids: &[Vec<usize>],
     lens: &[f32],
     leaf_ids: &[usize],
-    mut masks: Vec<BitVec<u8, Lsb0>>,   // <-- take ownership
-) -> Vec<f64>
-{
+    mut masks: Vec<BitVec<u8, Lsb0>>, // <-- take ownership
+) -> Vec<f64> {
     // constants
     let nsamp = masks.len();
     let total = lens.len();
     let n_threads = rayon::current_num_threads().max(1);
 
     // Partition samples into stripes by thread
-    let stripe = (nsamp + n_threads - 1) / n_threads;   // ceil
-    let words_str = (stripe + 63) >> 6;                 // u64s per stripe
+    let stripe = (nsamp + n_threads - 1) / n_threads; // ceil
+    let words_str = (stripe + 63) >> 6; // u64s per stripe
 
     // node_masks[tid][node][word]
-    let mut node_masks: Vec<Vec<Vec<u64>>> =
-        (0..n_threads)
-            .map(|_| vec![vec![0u64; words_str]; total])
-            .collect();
+    let mut node_masks: Vec<Vec<Vec<u64>>> = (0..n_threads)
+        .map(|_| vec![vec![0u64; words_str]; total])
+        .collect();
 
     // -------------------------
     // Phase-1 : build stripes
@@ -275,11 +337,13 @@ fn unifrac_striped_par(
     rayon::scope(|scope| {
         for (tid, node_masks_t) in node_masks.iter_mut().enumerate() {
             let stripe_start = tid * stripe;
-            if stripe_start >= nsamp { break; }          // no samples left
+            if stripe_start >= nsamp {
+                break;
+            } // no samples left
             let stripe_end = (stripe_start + stripe).min(nsamp);
 
             // Slice of masks for this stripe
-            let masks_slice = &masks[stripe_start .. stripe_end];
+            let masks_slice = &masks[stripe_start..stripe_end];
 
             // Borrowed tree scaffolding
             let leaf = leaf_ids;
@@ -320,41 +384,42 @@ fn unifrac_striped_par(
     let mut node_bits: Vec<BitVec<u64, Lsb0>> =
         (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
 
-    node_bits
-        .par_iter_mut()
-        .enumerate()
-        .for_each(|(v, bv)| {
-            let dst_words = bv.as_raw_mut_slice();          // &mut [u64]
-            for tid in 0..n_threads {
-                let stripe_start = tid * stripe;
-                let stripe_end   = (stripe_start + stripe).min(nsamp);
-                if stripe_start >= stripe_end { break; }
+    node_bits.par_iter_mut().enumerate().for_each(|(v, bv)| {
+        let dst_words = bv.as_raw_mut_slice(); // &mut [u64]
+        for tid in 0..n_threads {
+            let stripe_start = tid * stripe;
+            let stripe_end = (stripe_start + stripe).min(nsamp);
+            if stripe_start >= stripe_end {
+                break;
+            }
 
-                let src_words = &node_masks[tid][v];
-                let word_off  = stripe_start >> 6;
-                let bit_off   = (stripe_start & 63) as u32; // 0-63
+            let src_words = &node_masks[tid][v];
+            let word_off = stripe_start >> 6;
+            let bit_off = (stripe_start & 63) as u32; // 0-63
 
-                let n_src_words = src_words.len();
-                for w in 0..n_src_words {
-                    // mask tail bits (last word of the stripe)
-                    let mut val = src_words[w];
-                    if w == n_src_words - 1 {
-                        let tail_bits = (stripe_end - stripe_start) & 63;
-                        if tail_bits != 0 {
-                            val &= (1u64 << tail_bits) - 1;
-                        }
-                    }
-                    if val == 0 { continue; }
-
-                    // low part
-                    dst_words[word_off + w] |= val << bit_off;
-                    // carry into the next word if mis-aligned
-                    if bit_off != 0 && word_off + w + 1 < dst_words.len() {
-                        dst_words[word_off + w + 1] |= val >> (64 - bit_off);
+            let n_src_words = src_words.len();
+            for w in 0..n_src_words {
+                // mask tail bits (last word of the stripe)
+                let mut val = src_words[w];
+                if w == n_src_words - 1 {
+                    let tail_bits = (stripe_end - stripe_start) & 63;
+                    if tail_bits != 0 {
+                        val &= (1u64 << tail_bits) - 1;
                     }
                 }
+                if val == 0 {
+                    continue;
+                }
+
+                // low part
+                dst_words[word_off + w] |= val << bit_off;
+                // carry into the next word if mis-aligned
+                if bit_off != 0 && word_off + w + 1 < dst_words.len() {
+                    dst_words[word_off + w + 1] |= val >> (64 - bit_off);
+                }
             }
-        });
+        }
+    });
 
     // The per-stripe scratch is no longer needed after merge.
     drop(node_masks);
@@ -374,11 +439,11 @@ fn unifrac_striped_par(
     let mut active_per_strip: Vec<Vec<usize>> = vec![Vec::new(); nblk];
 
     for v in 0..total {
-        let raw = node_bits[v].as_raw_slice();   // &[u64]
+        let raw = node_bits[v].as_raw_slice(); // &[u64]
         for bi in 0..nblk {
             let i0 = bi * blk;
             let i1 = ((bi + 1) * blk).min(nsamp);
-            let w0 =  i0 >> 6;
+            let w0 = i0 >> 6;
             let w1 = (i1 + 63) >> 6;
             if raw[w0..w1].iter().any(|&w| w != 0) {
                 active_per_strip[bi].push(v);
@@ -390,15 +455,16 @@ fn unifrac_striped_par(
     // -----------------------------------------
     // Phase-3 : block sweep (upper triangle)
     // -----------------------------------------
-    let dist  = Arc::new(vec![0.0f64; nsamp * nsamp]);
-    let ptr   = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
+    let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
+    let ptr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
-    let pairs: Vec<(usize, usize)> =
-        (0..nblk).flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj))).collect();
+    let pairs: Vec<(usize, usize)> = (0..nblk)
+        .flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj)))
+        .collect();
 
     let t3 = Instant::now();
     pairs.into_par_iter().for_each(|(bi, bj)| {
-        let ptr  = ptr;
+        let ptr = ptr;
         let (i0, i1) = (bi * blk, ((bi + 1) * blk).min(nsamp));
         let (j0, j1) = (bj * blk, ((bj + 1) * blk).min(nsamp));
 
@@ -416,17 +482,31 @@ fn unifrac_striped_par(
         while ia < list_a.len() || ib < list_b.len() {
             let v = match (list_a.get(ia), list_b.get(ib)) {
                 (Some(&va), Some(&vb)) => {
-                    if va < vb { ia += 1; va }
-                    else if vb < va { ib += 1; vb }
-                    else { ia += 1; ib += 1; va }
+                    if va < vb {
+                        ia += 1;
+                        va
+                    } else if vb < va {
+                        ib += 1;
+                        vb
+                    } else {
+                        ia += 1;
+                        ib += 1;
+                        va
+                    }
                 }
-                (Some(&va), None) => { ia += 1; va }
-                (None,   Some(&vb)) => { ib += 1; vb }
+                (Some(&va), None) => {
+                    ia += 1;
+                    va
+                }
+                (None, Some(&vb)) => {
+                    ib += 1;
+                    vb
+                }
                 _ => unreachable!(),
             };
 
             let len = lens[v] as f64;
-            let words = node_bits[v].as_raw_slice();          // &[u64]
+            let words = node_bits[v].as_raw_slice(); // &[u64]
 
             for ii in 0..bw {
                 let samp_i = i0 + ii;
@@ -436,32 +516,42 @@ fn unifrac_striped_par(
 
                 for jj in 0..bh {
                     let samp_j = j0 + jj;
-                    if samp_j <= samp_i { continue; }
+                    if samp_j <= samp_i {
+                        continue;
+                    }
 
                     let word_j = words[samp_j >> 6];
                     let bit_j = 1u64 << (samp_j & 63);
                     let b_set = (word_j & bit_j) != 0;
 
-                    if !a_set && !b_set { continue; }          // nothing here
+                    if !a_set && !b_set {
+                        continue;
+                    } // nothing here
 
                     let idx = ii * bh + jj;
-                    union [idx] += len;                         // a ∨ b
-                    if  a_set &&  b_set { shared[idx] += len; } // a ∧ b
+                    union[idx] += len; // a ∨ b
+                    if a_set && b_set {
+                        shared[idx] += len;
+                    } // a ∧ b
                 }
             }
         }
 
-        // write-back 
+        // write-back
         unsafe {
             let base = ptr.0.as_ptr();
             for ii in 0..bw {
                 let i = i0 + ii;
                 for jj in 0..bh {
                     let j = j0 + jj;
-                    if j <= i { continue; }
+                    if j <= i {
+                        continue;
+                    }
                     let idx = ii * bh + jj;
                     let u = union[idx];
-                    if u == 0.0 { continue; }
+                    if u == 0.0 {
+                        continue;
+                    }
                     let d = 1.0 - shared[idx] / u;
                     *base.add(i * nsamp + j) = d;
                     *base.add(j * nsamp + i) = d;
@@ -479,28 +569,300 @@ fn unifrac_striped_par(
     Arc::try_unwrap(dist).unwrap()
 }
 
-fn read_biom_csr(p: &str)
-    -> Result<(Vec<String>, Vec<String>, Vec<u32>, Vec<u32>)>
-{
-    let f = H5File::open(p)
-        .with_context(|| format!("open BIOM file {p}"))?;
+
+/// Striped UniFrac (weighted, normalized)
+/// - Expects *relative* abundances per sample to be formed on the fly: val / col_sums[s].
+/// - Supports dense TSV or BIOM CSR via the `mode` argument.
+enum WeightedMode<'a> {
+    Dense { counts: &'a [Vec<f64>] }, // rows x nsamp
+    Csr   { indptr: &'a [u32], indices: &'a [u32], data: &'a [f64] }, // BIOM CSR
+}
+
+/// Compute weighted UniFrac with the same striped/block skeleton as unweighted.
+/// row2leaf[r] must be Some(leaf_pos) if taxa[r] maps to a leaf; None otherwise.
+/// lens is branch length per node id; kids/post from BP tree; leaf_ids maps leaf_pos->node id.
+fn unifrac_striped_par_weighted(
+    post: &[usize],
+    kids: &[Vec<usize>],
+    lens: &[f32],
+    leaf_ids: &[usize],
+    row2leaf: &[Option<usize>],
+    mode: WeightedMode,
+    nsamp: usize,
+    col_sums: &[f64], // per-sample totals (0, entire column is zeros)
+) -> Vec<f64> {
+    let total = lens.len();
+    let n_threads = rayon::current_num_threads().max(1);
+    let stripe = (nsamp + n_threads - 1) / n_threads; // ceil
+
+    // node_sums[tid][node][local_sample_in_stripe] as f64 (precision-safe for tests)
+    let mut node_sums: Vec<Vec<Vec<f64>>> = (0..n_threads)
+        .map(|tid| {
+            let stripe_start = tid * stripe;
+            if stripe_start >= nsamp {
+                Vec::new() // no samples here
+            } else {
+                let stripe_end = (stripe_start + stripe).min(nsamp);
+                let w = stripe_end - stripe_start;
+                vec![vec![0.0f64; w]; total]
+            }
+        })
+        .collect();
+
+    // Phase-1 : scatter leaves (relative abundances) and bottom-up sum per stripe
+    let t0 = Instant::now();
+        rayon::scope(|scope| {
+        for (tid, sums_t) in node_sums.iter_mut().enumerate() {
+            let stripe_start = tid * stripe;
+            if stripe_start >= nsamp { break; }
+            let stripe_end = (stripe_start + stripe).min(nsamp);
+            let wloc = stripe_end - stripe_start;
+
+            let kids = kids;
+            let post = post;
+            let lens = lens;
+            let leaf_ids = leaf_ids;
+
+            match &mode {
+                WeightedMode::Dense { counts } => {
+                    let counts = *counts; // capture by copy (&&[Vec<f64>] -> &[Vec<f64>])
+                    scope.spawn(move |_| {
+                        // scatter leaves
+                        for (r, lopt) in row2leaf.iter().enumerate() {
+                            let Some(leaf_pos) = lopt else { continue; };
+                            let v = leaf_ids[*leaf_pos]; // node id
+                            for s in stripe_start..stripe_end {
+                                let denom = col_sums[s];
+                                if denom <= 0.0 { continue; }
+                                let val = counts[r][s] / denom;
+                                if val > 0.0 {
+                                    sums_t[v][s - stripe_start] += val;
+                                }
+                            }
+                        }
+                        // bottom-up sum within the stripe
+                        for &v in post {
+                            for &c in &kids[v] {
+                                if c == v { continue; }
+                                if c < v {
+                                    let (left, right) = sums_t.split_at_mut(v);
+                                    let sv = &mut right[0];   // sums_t[v]
+                                    let sc = &left[c];        // sums_t[c]
+                                    for k in 0..wloc { sv[k] += sc[k]; }
+                                } else {
+                                    let (left, right) = sums_t.split_at_mut(c);
+                                    let sv = &mut left[v];    // sums_t[v]
+                                    let sc = &right[0];       // sums_t[c]
+                                    for k in 0..wloc { sv[k] += sc[k]; }
+                                }
+                            }
+                        }
+                        let _ = lens; // keep signature parity
+                    });
+                }
+                WeightedMode::Csr { indptr, indices, data } => {
+                    let indptr = *indptr;
+                    let indices = *indices;
+                    let data = *data;
+                    scope.spawn(move |_| {
+                        for r in 0..row2leaf.len() {
+                            let Some(leaf_pos) = row2leaf[r] else { continue; };
+                            let v = leaf_ids[leaf_pos];
+                            let start = indptr[r] as usize;
+                            let stop  = indptr[r + 1] as usize;
+                            for k in start..stop {
+                                let s = indices[k] as usize;
+                                if s < stripe_start || s >= stripe_end { continue; }
+                                let denom = col_sums[s];
+                                if denom <= 0.0 { continue; }
+                                let val = data[k] / denom;
+                                if val > 0.0 {
+                                    sums_t[v][s - stripe_start] += val;
+                                }
+                            }
+                        }
+                        // bottom-up sum within the stripe
+                        for &v in post {
+                            for &c in &kids[v] {
+                                if c == v { continue; }
+                                if c < v {
+                                    let (left, right) = sums_t.split_at_mut(v);
+                                    let sv = &mut right[0];
+                                    let sc = &left[c];
+                                    for k in 0..wloc { sv[k] += sc[k]; }
+                                } else {
+                                    let (left, right) = sums_t.split_at_mut(c);
+                                    let sv = &mut left[v];
+                                    let sc = &right[0];
+                                    for k in 0..wloc { sv[k] += sc[k]; }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+    log::info!("phase-1 (weighted) {:>6} ms", t0.elapsed().as_millis());
+
+    // Build node_bits (presence of any mass)
+    let mut node_bits: Vec<BitVec<u64, Lsb0>> =
+        (0..total).map(|_| BitVec::repeat(false, nsamp)).collect();
+
+    node_bits.par_iter_mut().enumerate().for_each(|(v, bv)| {
+        let dst_words = bv.as_raw_mut_slice(); // &mut [u64]
+        // walk all stripes and set bits where sums>0
+        for tid in 0..n_threads {
+            let stripe_start = tid * stripe;
+            if stripe_start >= nsamp { break; }
+            let local = &node_sums[tid];
+            if local.is_empty() { continue; }
+            let row = &local[v];
+            for (off, &val) in row.iter().enumerate() {
+                if val > 0.0 {
+                    let s = stripe_start + off;
+                    let w = s >> 6;
+                    let b = s & 63;
+                    dst_words[w] |= 1u64 << b;
+                }
+            }
+        }
+    });
+    // Phase-2 : active nodes per matrix strip (reused)
+    let est_blk = ((nsamp as f64 / (2.0 * n_threads as f64)).sqrt()) as usize;
+    let blk = est_blk.clamp(64, 512).next_power_of_two();
+    let nblk = (nsamp + blk - 1) / blk;
+
+    let mut active_per_strip: Vec<Vec<usize>> = vec![Vec::new(); nblk];
+    for v in 0..total {
+        if lens[v] <= 0.0 { continue; }
+        let raw = node_bits[v].as_raw_slice(); // &[u64]
+        for bi in 0..nblk {
+            let i0 = bi * blk;
+            let i1 = ((bi + 1) * blk).min(nsamp);
+            let w0 = i0 >> 6;
+            let w1 = (i1 + 63) >> 6;
+            if raw[w0..w1].iter().any(|&w| w != 0) {
+                active_per_strip[bi].push(v);
+            }
+        }
+    }
+    log::info!("phase-2 (weighted) lists built ({} strips)", nblk);
+
+    // Phase-3 : block sweep (upper triangle), accumulate numerator/denominator
+    let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
+    let ptr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
+
+    // utility: fetch a_v[s] from node_sums via stripe decomposition
+    #[inline]
+    fn get_av(node_sums: &Vec<Vec<Vec<f64>>>, stripe: usize, s: usize, v: usize) -> f64 {
+        let tid = s / stripe;
+        let off = s - tid * stripe;
+        if tid >= node_sums.len() { return 0.0; }
+        let local = &node_sums[tid];
+        if local.is_empty() { return 0.0; }
+        if off >= local[v].len() { return 0.0; }
+        local[v][off]
+    }
+
+    let pairs: Vec<(usize, usize)> = (0..nblk)
+        .flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj)))
+        .collect();
+
+    let t3 = Instant::now();
+    pairs.into_par_iter().for_each(|(bi, bj)| {
+        let ptr = ptr;
+
+        let (i0, i1) = (bi * blk, ((bi + 1) * blk).min(nsamp));
+        let (j0, j1) = (bj * blk, ((bj + 1) * blk).min(nsamp));
+        let bw = i1 - i0;
+        let bh = j1 - j0;
+
+        let mut num = vec![0.0f64; bw * bh]; // numerator
+        let mut den = vec![0.0f64; bw * bh]; // denominator
+
+        let list_a = &active_per_strip[bi];
+        let list_b = &active_per_strip[bj];
+        let mut ia = 0usize;
+        let mut ib = 0usize;
+
+        while ia < list_a.len() || ib < list_b.len() {
+            let v = match (list_a.get(ia), list_b.get(ib)) {
+                (Some(&va), Some(&vb)) => {
+                    if va < vb { ia += 1; va }
+                    else if vb < va { ib += 1; vb }
+                    else { ia += 1; ib += 1; va }
+                }
+                (Some(&va), None) => { ia += 1; va }
+                (None, Some(&vb)) => { ib += 1; vb }
+                _ => unreachable!(),
+            };
+
+            let len = lens[v] as f64;
+            if len == 0.0 { continue; }
+
+            for ii in 0..bw {
+                let si = i0 + ii;
+                for jj in 0..bh {
+                    let sj = j0 + jj;
+                    if sj <= si { continue; } // upper triangle only
+
+                    let ai = get_av(&node_sums, stripe, si, v);
+                    let aj = get_av(&node_sums, stripe, sj, v);
+                    if ai == 0.0 && aj == 0.0 { continue; }
+
+                    let idx = ii * bh + jj;
+                    num[idx] += len * (ai - aj).abs();
+                    den[idx] += len * (ai + aj);
+                }
+            }
+        }
+
+        unsafe {
+            let base = ptr.0.as_ptr();
+            for ii in 0..bw {
+                let i = i0 + ii;
+                for jj in 0..bh {
+                    let j = j0 + jj;
+                    if j <= i { continue; }
+                    let idx = ii * bh + jj;
+                    let d = if den[idx] > 0.0 { num[idx] / den[idx] } else { 0.0 };
+                    *base.add(i * nsamp + j) = d;
+                    *base.add(j * nsamp + i) = d;
+                }
+            }
+        }
+    });
+
+    // Free big working sets
+    drop(active_per_strip);
+    drop(node_sums);
+    drop(node_bits);
+
+    info!("phase-3 (weighted) {:>6} ms", t3.elapsed().as_millis());
+
+    Arc::try_unwrap(dist).unwrap()
+}
+
+
+
+fn read_biom_csr(p: &str) -> Result<(Vec<String>, Vec<String>, Vec<u32>, Vec<u32>)> {
+    let f = H5File::open(p).with_context(|| format!("open BIOM file {p}"))?;
 
     fn read_utf8(f: &H5File, path: &str) -> Result<Vec<String>> {
         Ok(f.dataset(path)?
-             .read_1d::<VarLenUnicode>()?
-             .into_iter()
-             .map(|v| v.as_str().to_owned())
-             .collect())
+            .read_1d::<VarLenUnicode>()?
+            .into_iter()
+            .map(|v| v.as_str().to_owned())
+            .collect())
     }
     fn read_u32(f: &H5File, path: &str) -> Result<Vec<u32>> {
         Ok(f.dataset(path)?.read_raw::<u32>()?.to_vec())
     }
 
     // required datasets
-    let taxa = read_utf8(&f, "observation/ids")
-        .context("missing observation/ids")?;
-    let samples = read_utf8(&f, "sample/ids")
-        .context("missing sample/ids")?;
+    let taxa = read_utf8(&f, "observation/ids").context("missing observation/ids")?;
+    let samples = read_utf8(&f, "sample/ids").context("missing sample/ids")?;
 
     // CSR arrays may be directly under observation/  (old BIOM 2.0)
     // or under observation/matrix/  (current spec).  Try the new path
@@ -517,12 +879,59 @@ fn read_biom_csr(p: &str)
     Ok((taxa, samples, indptr, indices))
 }
 
+fn read_biom_csr_values(p: &str) -> Result<(Vec<String>, Vec<String>, Vec<u32>, Vec<u32>, Vec<f64>)> {
+    let f = H5File::open(p).with_context(|| format!("open BIOM file {p}"))?;
+
+    fn read_utf8(f: &H5File, path: &str) -> Result<Vec<String>> {
+        Ok(f.dataset(path)?
+            .read_1d::<VarLenUnicode>()?
+            .into_iter()
+            .map(|v| v.as_str().to_owned())
+            .collect())
+    }
+
+    fn read_u32(f: &H5File, path: &str) -> Result<Vec<u32>> {
+        Ok(f.dataset(path)?.read_raw::<u32>()?.to_vec())
+    }
+
+    // try f64 then f32 for matrix/data
+    fn read_f64_flex(f: &H5File, path: &str) -> Result<Vec<f64>> {
+        if let Ok(v) = f.dataset(path)?.read_raw::<f64>() {
+            Ok(v.to_vec())
+        } else {
+            let v32 = f.dataset(path)?.read_raw::<f32>()?;
+            Ok(v32.iter().map(|&x| x as f64).collect())
+        }
+    }
+
+    let taxa = read_utf8(&f, "observation/ids").context("missing observation/ids")?;
+    let samples = read_utf8(&f, "sample/ids").context("missing sample/ids")?;
+
+    let try_paths_u32 = |name: &str| -> Result<Vec<u32>> {
+        read_u32(&f, &format!("observation/matrix/{name}"))
+            .or_else(|_| read_u32(&f, &format!("observation/{name}")))
+            .with_context(|| format!("missing observation/**/{name}"))
+    };
+
+    let try_paths_f64 = |name: &str| -> Result<Vec<f64>> {
+        read_f64_flex(&f, &format!("observation/matrix/{name}"))
+            .or_else(|_| read_f64_flex(&f, &format!("observation/{name}")))
+            .with_context(|| format!("missing observation/**/{name}"))
+    };
+
+    let indptr  = try_paths_u32("indptr")?;
+    let indices = try_paths_u32("indices")?;
+    let data    = try_paths_f64("data")?;
+
+    Ok((taxa, samples, indptr, indices, data))
+}
+
 fn main() -> Result<()> {
     println!("\n ************** initializing logger *****************\n");
     env_logger::Builder::from_default_env().init();
     log::info!("logger initialized from default environment");
     let m = Command::new("unifrac-rs")
-        .version("0.2.1")
+        .version("0.2.2")
         .about("Striped UniFrac via Optimal Balanced Parenthesis")
         .arg(
             Arg::new("tree")
@@ -539,7 +948,7 @@ fn main() -> Result<()> {
                 .required(false),
         )
         .arg(
-            Arg::new("biom") 
+            Arg::new("biom")
                 .short('m')
                 .long("biom")
                 .help("OTU/Feature table in BIOM (HDF5) format")
@@ -549,6 +958,19 @@ fn main() -> Result<()> {
             ArgGroup::new("table")
                 .args(["input", "biom"])
                 .required(true),
+        )
+        .arg(
+            Arg::new("weighted")
+                .long("weighted")
+                .help("Weighted UniFrac (normalized). Per-sample relative abundances will be used")
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("threads")
+                .long("threads")
+                .short('T')
+                .help("Number of threads, default all logical cores")
+                .value_parser(clap::value_parser!(usize)),
         )
         .arg(
             Arg::new("output")
@@ -562,8 +984,13 @@ fn main() -> Result<()> {
     let tree_file = m.get_one::<String>("tree").unwrap();
     let out_file = m.get_one::<String>("output").unwrap();
 
+    let threads = m
+    .get_one::<usize>("threads")
+    .copied()
+    .unwrap_or_else(|| num_cpus::get());
+
     rayon::ThreadPoolBuilder::new()
-        .num_threads(num_cpus::get())
+        .num_threads(threads.max(1))
         .build_global()
         .unwrap();
 
@@ -583,7 +1010,9 @@ fn main() -> Result<()> {
         if t[n].is_leaf() {
             leaf_ids.push(n);
             leaf_nm.push(
-                t.name(n).map(ToOwned::to_owned).unwrap_or_else(|| format!("L{n}")),
+                t.name(n)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| format!("L{n}")),
             );
         }
     }
@@ -599,77 +1028,140 @@ fn main() -> Result<()> {
     let mut kids = vec![Vec::<usize>::new(); total];
     let mut post = Vec::<usize>::with_capacity(total);
     collect_children::<SparseOneNnd>(&bp.root(), &mut kids, &mut post);
-    log::info!("Total branches with positive length: {}", lens.iter().filter(|&&l| l > 0.0).count());
+    log::info!(
+        "Total branches with positive length: {}",
+        lens.iter().filter(|&&l| l > 0.0).count()
+    );
 
     let mut node2leaf = vec![usize::MAX; total];
     for (leaf_pos, &nid) in leaf_ids.iter().enumerate() {
         node2leaf[nid] = leaf_pos;
     }
     drop(node2leaf);
-    // Read table (TSV or BIOM)
-    let (mut taxa, samples, pres_dense);
-    let mut pres = Vec::<Vec<f64>>::new();     // only for TSV
-    let mut indptr = Vec::<u32>::new();         // only for BIOM
-    let mut indices = Vec::<u32>::new();         // only for BIOM
+    // Read table (TSV or BIOM) and weighted/unweighted split 
     log::info!("Start parsing input.");
+    let weighted = *m.get_one::<bool>("weighted").unwrap_or(&false);
+
+    let samples: Vec<String>;
+    let mut taxa: Vec<String>;
+
+    // Data containers
+    let mut pres: Vec<Vec<f64>> = Vec::new();     // TSV (presence) for unweighted
+    let mut counts: Vec<Vec<f64>> = Vec::new();   // TSV counts for weighted
+    let mut indptr:  Vec<u32> = Vec::new();       // BIOM (both modes)
+    let mut indices: Vec<u32> = Vec::new();       // BIOM (both modes)
+    let mut data:    Vec<f64> = Vec::new();       // BIOM values for weighted
+    let mut pres_dense = false;                   // true, TSV mode
+
     if let Some(tsv) = m.get_one::<String>("input") {
-        let (t,s,mat) = read_table(tsv)?;
-        taxa = t;
-        samples = s;
-        pres = mat;
         pres_dense = true;
+        if weighted {
+            let (t, s, mat) = read_table_counts(tsv)?;
+            taxa = t; samples = s; counts = mat;
+        } else {
+            let (t, s, mat) = read_table(tsv)?;
+            taxa = t; samples = s; pres = mat;
+        }
     } else {
+        // BIOM
         let biom = m.get_one::<String>("biom").unwrap();
-        let (t,s,ip,idx) = read_biom_csr(biom)?;
-        taxa = t; 
-        samples = s; 
-        indptr = ip;
-        indices = idx;
-        pres_dense = false;
+        if weighted {
+            let (t, s, ip, idx, vals) = read_biom_csr_values(biom)?;
+            taxa = t; samples = s; indptr = ip; indices = idx; data = vals;
+        } else {
+            let (t, s, ip, idx) = read_biom_csr(biom)?;
+            taxa = t; samples = s; indptr = ip; indices = idx;
+        }
     }
-    
 
     let nsamp = samples.len();
-    let mut masks: Vec<BitVec<u8, Lsb0>> =
-        (0..nsamp).map(|_| BitVec::repeat(false, leaf_ids.len())).collect();
 
-    // Build masks
-    if pres_dense {
-        for (ti, tax) in taxa.iter().enumerate() {
-            if let Some(&leaf) = t2leaf.get(tax.as_str()) {
-                for (s, bits) in masks.iter_mut().enumerate() {
-                    if pres[ti][s] > 0.0 {
-                        bits.set(leaf, true);
+    // Map each input row (taxon) to a leaf position (if present)
+    let row2leaf: Vec<Option<usize>> = taxa.iter()
+        .map(|name| t2leaf.get(name.as_str()).copied())
+        .collect();
+
+    // Dispatch
+    let dist: Vec<f64> = if weighted {
+        // per-sample column sums for relative abundances
+        let mut col_sums = vec![0.0f64; nsamp];
+        if pres_dense {
+            for r in 0..counts.len() {
+                for s in 0..nsamp {
+                    col_sums[s] += counts[r][s];
+                }
+            }
+            // compute and go
+            unifrac_striped_par_weighted(
+                &post, &kids, &lens, &leaf_ids, &row2leaf,
+                WeightedMode::Dense { counts: &counts },
+                nsamp,
+                &col_sums,
+            )
+        } else {
+            for r in 0..taxa.len() {
+                let start = indptr[r] as usize;
+                let stop  = indptr[r + 1] as usize;
+                for k in start..stop {
+                    let s = indices[k] as usize;
+                    col_sums[s] += data[k];
+                }
+            }
+            unifrac_striped_par_weighted(
+                &post, &kids, &lens, &leaf_ids, &row2leaf,
+                WeightedMode::Csr { indptr: &indptr, indices: &indices, data: &data },
+                nsamp,
+                &col_sums,
+            )
+        }
+    } else {
+        // Unweighted
+        let mut masks: Vec<BitVec<u8, Lsb0>> = (0..nsamp)
+            .map(|_| BitVec::repeat(false, leaf_ids.len()))
+            .collect();
+
+        if pres_dense {
+            for (r, lopt) in row2leaf.iter().enumerate() {
+                if let Some(leaf_pos) = lopt {
+                    let leaf = *leaf_pos;
+                    for (s, bits) in masks.iter_mut().enumerate() {
+                        if pres[r][s] > 0.0 {
+                            bits.set(leaf, true);
+                        }
+                    }
+                }
+            }
+        } else {
+            for r in 0..taxa.len() {
+                if let Some(leaf_pos) = row2leaf[r] {
+                    let start = indptr[r] as usize;
+                    let stop  = indptr[r + 1] as usize;
+                    for k in start..stop {
+                        let s = indices[k] as usize;
+                        masks[s].set(leaf_pos, true);
                     }
                 }
             }
         }
-    } else {
-        for row in 0..taxa.len() {
-            if let Some(&leaf) = t2leaf.get(taxa[row].as_str()) {
-                let start = indptr[row] as usize;
-                let stop = indptr[row + 1] as usize;
-                for k in start..stop {
-                    let s = indices[k] as usize;
-                    masks[s].set(leaf, true);
-                }
-            }
-        }
-    }
+        unifrac_striped_par(&post, &kids, &lens, &leaf_ids, masks)
+    };
+
+    // Free now-redundant big structures
     drop(t2leaf);
-    leaf_nm.clear();
+    leaf_nm.clear(); 
     leaf_nm.shrink_to_fit();
-    taxa.clear();
+    taxa.clear();    
     taxa.shrink_to_fit();
     pres.clear();
-    pres.shrink_to_fit(); 
-    indptr.clear(); 
+    pres.shrink_to_fit();
+    counts.clear();
+    counts.shrink_to_fit();
+    indptr.clear();
     indptr.shrink_to_fit();
     indices.clear();
     indices.shrink_to_fit();
-    // Compute UniFrac
-    let dist = unifrac_striped_par(&post, &kids, &lens, &leaf_ids, masks);
-
+    data.clear();
+    data.shrink_to_fit();
     drop(kids);
     drop(post);
     drop(leaf_ids);
@@ -677,6 +1169,6 @@ fn main() -> Result<()> {
     lens.shrink_to_fit();
 
     log::info!("Start writing output.");
-    // Write output 
+    // Write output
     write_matrix(&samples, &dist, nsamp, out_file)
 }
