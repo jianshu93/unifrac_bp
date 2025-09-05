@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "stdsimd", feature(portable_simd))]
+
 //! BSD 3-Clause License
 //!
 //! Copyright (c) 2016-2025, UniFrac development team.
@@ -8,6 +10,7 @@
 //! succinct-BP UniFrac  (unweighted)
 //!  * --striped – single post-order pass, **parallel blocks**
 //!      (works for tens-of-thousands samples)
+
 use anyhow::{Context, Result};
 use bitvec::{order::Lsb0, vec::BitVec};
 use clap::ArgAction;
@@ -35,6 +38,16 @@ use succparen::{
         traversal::{DepthFirstTraverse, VisitNode},
     },
 };
+
+
+#[cfg(feature = "stdsimd")]
+use std::simd::{LaneCount, Simd, SupportedLaneCount};
+
+#[cfg(feature = "stdsimd")]
+use std::simd::prelude::*; 
+
+#[cfg(feature = "stdsimd")]
+use std::simd::StdFloat;
 
 // Plain new-type – automatically `Copy`.
 #[derive(Clone, Copy)]
@@ -585,6 +598,69 @@ enum WeightedMode<'a> {
     }, // BIOM CSR
 }
 
+#[cfg(feature = "stdsimd")]
+fn simd_accum_block_f64<const LANES: usize>(
+    num: &mut [f64],              // bw * bh
+    den: &mut [f64],              // bw * bh
+    bw: usize, bh: usize,         // block width/height (i×j)
+    i0: usize, j0: usize,         // block origin (global sample indices)
+    v: usize, len: f64,           // node id and branch length
+    node_sums: &Vec<Vec<Vec<f64>>>,
+    stripe: usize,
+) where
+    LaneCount<LANES>: SupportedLaneCount,
+{
+    let tid_i = i0 / stripe;
+    let tid_j = j0 / stripe;
+
+    let row_i = &node_sums[tid_i][v];
+    let row_j = &node_sums[tid_j][v];
+
+    let off_i0 = i0 - tid_i * stripe;
+    let off_j0 = j0 - tid_j * stripe;
+
+    let lenv = Simd::<f64, LANES>::splat(len);
+
+    for ii in 0..bw {
+        let ai   = row_i[off_i0 + ii];
+        let ai_v = Simd::<f64, LANES>::splat(ai);
+
+        let mut jj = 0usize;
+        while jj + LANES <= bh {
+            // load aj
+            let aj_v = Simd::<f64, LANES>::from_slice(
+                &row_j[off_j0 + jj .. off_j0 + jj + LANES]
+            );
+
+            let idx0 = ii * bh + jj;
+
+            // load accumulators
+            let num_v = Simd::<f64, LANES>::from_slice(&num[idx0 .. idx0 + LANES]);
+            let den_v = Simd::<f64, LANES>::from_slice(&den[idx0 .. idx0 + LANES]);
+
+            // fused multiply-add
+            let diff   = (ai_v - aj_v).abs();
+            let sum    =  ai_v + aj_v;
+            let num_rs = diff.mul_add(lenv, num_v);
+            let den_rs =  sum.mul_add(lenv, den_v);
+
+            // store back
+            num[idx0 .. idx0 + LANES].copy_from_slice(num_rs.as_array());
+            den[idx0 .. idx0 + LANES].copy_from_slice(den_rs.as_array());
+
+            jj += LANES;
+        }
+
+        // scalar tail
+        for jj_t in jj..bh {
+            let aj  = row_j[off_j0 + jj_t];
+            let idx = ii * bh + jj_t;
+            num[idx] += len * (ai - aj).abs();
+            den[idx] += len * (ai + aj);
+        }
+    }
+}
+
 /// Compute weighted UniFrac with the same striped/block skeleton as unweighted.
 /// row2leaf[r] must be Some(leaf_pos) if taxa[r] maps to a leaf; None otherwise.
 /// lens is branch length per node id; kids/post from BP tree; leaf_ids maps leaf_pos->node id.
@@ -864,23 +940,69 @@ fn unifrac_striped_par_weighted(
                 continue;
             }
 
-            for ii in 0..bw {
-                let si = i0 + ii;
-                for jj in 0..bh {
-                    let sj = j0 + jj;
-                    if sj <= si {
-                        continue;
-                    } // upper triangle only
+            #[cfg(feature = "stdsimd")]
+            {
+                // Off-diagonal blocks only (your diagonal keeps j > i)
+                if bi != bj {
+                    let i1 = i0 + bw;
+                    let j1 = j0 + bh;
+                    let ti = i0 / stripe;
+                    let tj = j0 / stripe;
 
-                    let ai = get_av(&node_sums, stripe, si, v);
-                    let aj = get_av(&node_sums, stripe, sj, v);
-                    if ai == 0.0 && aj == 0.0 {
+                    let block_within_i_stripe = i1 <= (ti + 1) * stripe;
+                    let block_within_j_stripe = j1 <= (tj + 1) * stripe;
+
+                    let stripes_ok = ti < node_sums.len()
+                        && tj < node_sums.len()
+                        && !node_sums[ti].is_empty()
+                        && !node_sums[tj].is_empty();
+
+                    if block_within_i_stripe && block_within_j_stripe && stripes_ok {
+                        const LANES: usize = 8; // good default for f64
+                        simd_accum_block_f64::<LANES>(
+                            &mut num, &mut den, bw, bh, i0, j0, v, len, &node_sums, stripe,
+                        );
                         continue;
                     }
+                }
 
-                    let idx = ii * bh + jj;
-                    num[idx] += len * (ai - aj).abs();
-                    den[idx] += len * (ai + aj);
+                // diagonal or cross-stripe fallback (scalar, preserves j > i)
+                for ii in 0..bw {
+                    let si = i0 + ii;
+                    let ai = get_av(&node_sums, stripe, si, v);
+                    let jj_start = if bi == bj { ii + 1 } else { 0 };
+                    for jj in jj_start..bh {
+                        let sj = j0 + jj;
+                        let aj = get_av(&node_sums, stripe, sj, v);
+                        if ai == 0.0 && aj == 0.0 {
+                            continue;
+                        }
+                        let idx = ii * bh + jj;
+                        num[idx] += len * (ai - aj).abs();
+                        den[idx] += len * (ai + aj);
+                    }
+                }
+            }
+
+            #[cfg(not(feature = "stdsimd"))]
+            {
+                // original scalar path (unchanged)
+                for ii in 0..bw {
+                    let si = i0 + ii;
+                    let ai = get_av(&node_sums, stripe, si, v);
+                    for jj in 0..bh {
+                        let sj = j0 + jj;
+                        if sj <= si {
+                            continue;
+                        }
+                        let aj = get_av(&node_sums, stripe, sj, v);
+                        if ai == 0.0 && aj == 0.0 {
+                            continue;
+                        }
+                        let idx = ii * bh + jj;
+                        num[idx] += len * (ai - aj).abs();
+                        den[idx] += len * (ai + aj);
+                    }
                 }
             }
         }

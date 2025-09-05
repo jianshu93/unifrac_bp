@@ -27,3 +27,7 @@ hdf5 = { package = "hdf5-metno", version = "0.10", features = ["static", "zlib"]
 ryu = "1.0"
 
 
+[features]
+default = []
+
+stdsimd = []
