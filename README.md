@@ -74,7 +74,7 @@ $ RUST_LOG=info striped_unifrac -t ./GMTOLsong_table2024_N20_f2all_V4_table.nwk 
 [2025-08-31T06:08:42Z INFO  striped_unifrac] Start parsing input.
 [2025-08-31T06:08:53Z INFO  striped_unifrac] phase-1 (weighted)    245 ms
 [2025-08-31T06:08:53Z INFO  striped_unifrac] phase-2 (weighted) lists built (62 strips)
-[2025-08-31T06:09:24Z INFO  striped_unifrac] phase-3 (weighted)  31067 ms
+[2025-08-31T06:09:24Z INFO  striped_unifrac] phase-3 (weighted)  12467 ms
 [2025-08-31T06:09:24Z INFO  striped_unifrac] Start writing output.
 
 ```
@@ -101,11 +101,27 @@ sys
 
 ```
 
+Weighted
+
+
+```bash
+$ RUST_LOG=info unifrac -t ./emp90.5000_1000_rxbl_placement_pruned75.tog.tre -m ./emp.90.min25.deblur.withtax.withtree.even1k.biom --weighted -o emp.90.weighted.tsv
+
+ ************** initializing logger *****************
+
+[2025-09-05T16:23:57Z INFO  striped_unifrac] logger initialized from default environment
+[2025-09-05T16:24:03Z INFO  striped_unifrac] Total branches with positive length: 953222
+[2025-09-05T16:24:03Z INFO  striped_unifrac] Start parsing input.
+[2025-09-05T16:24:08Z INFO  striped_unifrac] parent pointers built in 4 ms
+[2025-09-05T16:24:08Z INFO  striped_unifrac] block geometry: blk=64, nblk=393, threads=128
+[2025-09-05T16:36:29Z INFO  striped_unifrac] weighted striped pass done in 740320 ms
+[2025-09-05T16:36:29Z INFO  striped_unifrac] Start writing output.
+
+```
+
 ### todo
 
-1.SIMD (another 2-5 times speedup for the block pass phase)
-
-2.GPU offloading
+GPU offloading via cudarc-rs
 
 ## References
 1.Lozupone, C. and Knight, R., 2005. UniFrac: a new phylogenetic method for comparing microbial communities. Applied and environmental microbiology, 71(12), pp.8228-8235.
