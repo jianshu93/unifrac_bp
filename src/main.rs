@@ -7,9 +7,10 @@
 //!
 //! See LICENSE file for more details
 
-//! succinct-BP UniFrac  (unweighted)
+//! succinct-BP UniFrac  (unweighted and weighted)
 //!  * --striped – single post-order pass, **parallel blocks**
 //!      (works for tens-of-thousands samples)
+//!  SIMD support
 
 use anyhow::{Context, Result};
 use bitvec::{order::Lsb0, vec::BitVec};
