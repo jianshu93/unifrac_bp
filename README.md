@@ -5,7 +5,7 @@ It uses the succint data strucuture (balanced parenthesis) in [succparen](https:
 
 Striped UniFrac is the default algorithm and it is extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
 
-Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only) for ~4 thousand samples. I will stop optimizatizing here because this crate was developed for benchmark purposes.
+Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only). I will stop optimizatizing here because this crate was developed for benchmark purposes.
 
 
 ## Install
@@ -105,17 +105,26 @@ Weighted
 
 
 ```bash
-$ RUST_LOG=info unifrac -t ./emp90.5000_1000_rxbl_placement_pruned75.tog.tre -m ./emp.90.min25.deblur.withtax.withtree.even1k.biom --weighted -o emp.90.weighted.tsv
+$ RUST_LOG=info unifrac -t ./emp90.5000_1000_rxbl_placement_pruned75.tog.tre -m ./emp.90.min25.deblur.withtax.withtree.even1k.biom --weighted -o emp.90.weighted.simd.tsv
 
  ************** initializing logger *****************
 
-[2025-09-05T16:23:57Z INFO  striped_unifrac] logger initialized from default environment
-[2025-09-05T16:24:03Z INFO  striped_unifrac] Total branches with positive length: 953222
-[2025-09-05T16:24:03Z INFO  striped_unifrac] Start parsing input.
-[2025-09-05T16:24:08Z INFO  striped_unifrac] parent pointers built in 4 ms
-[2025-09-05T16:24:08Z INFO  striped_unifrac] block geometry: blk=64, nblk=393, threads=128
-[2025-09-05T16:36:29Z INFO  striped_unifrac] weighted striped pass done in 740320 ms
-[2025-09-05T16:36:29Z INFO  striped_unifrac] Start writing output.
+[2025-09-06T01:24:17Z INFO  striped_unifrac] logger initialized from default environment
+[2025-09-06T01:24:22Z INFO  striped_unifrac] Total branches with positive length: 953222
+[2025-09-06T01:24:22Z INFO  striped_unifrac] Start parsing input.
+[2025-09-06T01:24:29Z INFO  striped_unifrac] parent pointers built in 3 ms
+[2025-09-06T01:24:29Z INFO  striped_unifrac] block geometry: blk=64, nblk=393, threads=128
+[2025-09-06T01:34:07Z INFO  striped_unifrac] weighted striped pass done in 577646 ms
+[2025-09-06T01:34:07Z INFO  striped_unifrac] Start writing output.
+
+```
+
+```bash
+$ time unifrac-binaries -t ./emp90.5000_1000_rxbl_placement_pruned75.tog.tre -i ./emp.90.min25.deblur.withtax.withtree.even1k.biom -m weighted_normalized -o emp.90.weighted.C++.tsv
+
+real	9m36.005s
+user	788m34.395s
+sys	3m11.660s
 
 ```
 
