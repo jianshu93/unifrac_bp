@@ -1,3 +1,5 @@
+[![Latest Version](https://img.shields.io/crates/v/unifrac_rs?style=for-the-badge&color=mediumpurple&logo=rust)](https://crates.io/crates/unifrac_rs)
+
 # UniFrac implememtation in Rust
 
 This repo shows how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance (unweighted, weighted and generalized) between pairs of samples containing taxa. 
