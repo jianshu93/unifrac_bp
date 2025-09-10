@@ -1,6 +1,6 @@
 # UniFrac implememtation in Rust
 
-This repo shows how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance (unweighted, weighted and genralized) between pairs of samples containing taxa. 
+This repo shows how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance (unweighted, weighted and generalized) between pairs of samples containing taxa. 
 It uses the succint data strucuture (balanced parenthesis) in [succparen](https://github.com/sile/succparen.git) crate to represent a phylogenetic tree so that then the tree is huge, UniFrac computation can still be fast. SIMD was used to speed up all computations.
 
 Striped UniFrac is the default algorithm and it is extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
