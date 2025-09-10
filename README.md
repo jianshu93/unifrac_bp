@@ -5,7 +5,7 @@ It uses the succint data strucuture (balanced parenthesis) in [succparen](https:
 
 Striped UniFrac is the default algorithm and it is extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
 
-Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only). I will stop optimizatizing here because this crate was developed for benchmark [DartUniFrac](https://github.com/jianshu93/dartunifrac.git).
+Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only). I will stop optimizatizing here because this crate was developed for benchmarking [DartUniFrac](https://github.com/jianshu93/dartunifrac.git).
 
 
 ## Install
