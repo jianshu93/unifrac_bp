@@ -1,11 +1,11 @@
 # UniFrac implememtation in Rust
 
-This repo shows how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance (both unweighted and weighted) between pairs of samples containing taxa. 
-It uses the succint data strucuture (balanced parenthesis) in [succparen](https://github.com/sile/succparen.git) crate to represent a phylogenetic tree so that then the tree is huge, UniFrac computation can still be fast.
+This repo shows how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance (unweighted, weighted and genralized) between pairs of samples containing taxa. 
+It uses the succint data strucuture (balanced parenthesis) in [succparen](https://github.com/sile/succparen.git) crate to represent a phylogenetic tree so that then the tree is huge, UniFrac computation can still be fast. SIMD was used to speed up all computations.
 
 Striped UniFrac is the default algorithm and it is extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
 
-Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only). I will stop optimizatizing here because this crate was developed for benchmark purposes.
+Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only). I will stop optimizatizing here because this crate was developed for benchmark [DartUniFrac](https://github.com/jianshu93/dartunifrac.git).
 
 
 ## Install
@@ -19,12 +19,11 @@ cargo build --release
 
 ## Usage 
 ```bash
-
- ************** initializing logger *****************
+************** initializing logger *****************
 
 Striped UniFrac via Optimal Balanced Parenthesis
 
-Usage: striped_unifrac [OPTIONS] --tree <tree> <--input <input>|--biom <biom>>
+Usage: unifrac [OPTIONS] --tree <tree> <--input <input>|--biom <biom>>
 
 Options:
   -t, --tree <tree>        Input tree in Newick format
@@ -33,6 +32,8 @@ Options:
       --weighted           Weighted UniFrac (normalized). Per-sample relative abundances will be used
   -T, --threads <threads>  Number of threads, default all logical cores
   -o, --output <output>    Output distance matrix in TSV format [default: unifrac.tsv]
+      --generalized        Generalized UniFrac
+      --alpha <alpha>      Alpha parameter for Generalized UniFrac (default 0.5). Only used with --generalized. [default: 0.5]
   -h, --help               Print help
   -V, --version            Print version
 ```
@@ -45,6 +46,9 @@ cat try.txt
 
 ### Weighted 
 ./target/release/unifrac -t data/test.nwk -i data/test_OTU_table.txt --weighted  -o try.txt
+
+### generalized
+./target/release/unifrac -t data/test.nwk -i data/test_OTU_table.txt --generalized  -o try.txt
 ```
 
 
@@ -142,3 +146,5 @@ GPU offloading via cudarc-rs
 4.McDonald, D., Vázquez-Baeza, Y., Koslicki, D., McClelland, J., Reeve, N., Xu, Z., Gonzalez, A. and Knight, R., 2018. Striped UniFrac: enabling microbiome analysis at unprecedented scale. Nature methods, 15(11), pp.847-848.
 
 5.Sfiligoi, I., Armstrong, G., Gonzalez, A., McDonald, D. and Knight, R., 2022. Optimizing UniFrac with OpenACC yields greater than one thousand times speed increase. Msystems, 7(3), pp.e00028-22.
+
+6.Chen, J., Bittinger, K., Charlson, E.S., Hoffmann, C., Lewis, J., Wu, G.D., Collman, R.G., Bushman, F.D. and Li, H., 2012. Associating microbiome composition with environmental covariates using generalized UniFrac distances. Bioinformatics, 28(16), pp.2106-2113.
