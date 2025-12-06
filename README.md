@@ -2,10 +2,10 @@
 
 # UniFrac implememtation in Rust
 
-This repo shows how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance (unweighted, weighted and generalized) between pairs of samples containing taxa. 
+This repo shows how to compute the [UniFrac](https://en.wikipedia.org/wiki/UniFrac) distance (unweighted, weighted, generalized and variance-adjusted) between pairs of samples containing taxa. 
 It uses the succint data strucuture (balanced parenthesis) in [succparen](https://github.com/sile/succparen.git) crate to represent a phylogenetic tree so that then the tree is huge, UniFrac computation can still be fast. SIMD was used to speed up all computations.
 
-Striped UniFrac is the default algorithm and it is extremely fast for large number of samples. In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
+Striped UniFrac is the default algorithm and it is extremely fast for large number of samples (unweighted and weighted). In fact, with sparse features of input samples, the complexity is close to O((N/s)^2), where s is average sparsity (average proportion of taxa detected at least once in pairs of samples/all taxa in the tree). An average sparsity of 5% indicates a 0.0025 scale down from O(N^2). 
 
 Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only). I will stop optimizatizing here because this crate was developed for benchmarking [DartUniFrac](https://github.com/jianshu93/dartunifrac.git).
 
@@ -36,6 +36,7 @@ Options:
   -o, --output <output>    Output distance matrix in TSV format [default: unifrac.tsv]
       --generalized        Generalized UniFrac
       --alpha <alpha>      Alpha parameter for Generalized UniFrac (default 0.5). Only used with --generalized. [default: 0.5]
+      --vaw
   -h, --help               Print help
   -V, --version            Print version
 ```
@@ -150,3 +151,5 @@ GPU offloading via cudarc-rs
 5.Sfiligoi, I., Armstrong, G., Gonzalez, A., McDonald, D. and Knight, R., 2022. Optimizing UniFrac with OpenACC yields greater than one thousand times speed increase. Msystems, 7(3), pp.e00028-22.
 
 6.Chen, J., Bittinger, K., Charlson, E.S., Hoffmann, C., Lewis, J., Wu, G.D., Collman, R.G., Bushman, F.D. and Li, H., 2012. Associating microbiome composition with environmental covariates using generalized UniFrac distances. Bioinformatics, 28(16), pp.2106-2113.
+
+7.Chang, Q., Luan, Y. and Sun, F., 2011. Variance adjusted weighted UniFrac: a powerful beta diversity measure for comparing communities based on phylogeny. BMC bioinformatics, 12(1), p.118.
