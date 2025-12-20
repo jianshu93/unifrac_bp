@@ -301,12 +301,12 @@ fn extract_words_into(raw: &[u64], start_bit: usize, len_bits: usize, dst: &mut 
 
 unsafe fn scatter_band_f32_to_host_f64(
     out_ptr: DistPtr,
-    band: &[f32],   // length = blk * nsamp (or >= bw*nsamp)
+    band: &[f32], // length = blk * nsamp (or >= bw*nsamp)
     i0: usize,
     bw: usize,
     nsamp: usize,
 ) {
-    // Rust 2024: even inside unsafe fn, raw pointer ops must be inside unsafe block.
+    // Rust 2024: raw pointer ops must be inside an explicit unsafe block.
     unsafe {
         let base = out_ptr.as_mut_ptr();
         for ii in 0..bw {
@@ -494,10 +494,13 @@ pub fn unifrac_striped_unweighted_gpu(
                         stream.synchronize()?;
                         stream.memcpy_dtoh(&d_band, &mut h_band)?;
 
-                        // FIX: PinnedHostSlice -> &[f32]
-                        unsafe {
-                            scatter_band_f32_to_host_f64(out_ptr, h_band.as_slice(), i0, bw, nsamp)
-                        };
+                        // FIX #1: as_slice() returns Result<_, DriverError> on your cudarc
+                        let h_slice: &[f32] = h_band
+                            .as_slice()
+                            .map_err(|e| anyhow::anyhow!(e))
+                            .context("PinnedHostSlice::as_slice failed (unweighted)")?;
+
+                        unsafe { scatter_band_f32_to_host_f64(out_ptr, h_slice, i0, bw, nsamp) };
 
                         done_bi += 1;
                         if opts.progress_every > 0 && (done_bi % opts.progress_every == 0) {
@@ -771,10 +774,13 @@ pub fn unifrac_striped_weighted_gpu(
                         stream.synchronize()?;
                         stream.memcpy_dtoh(&d_band, &mut h_band)?;
 
-                        // FIX: PinnedHostSlice -> &[f32]
-                        unsafe {
-                            scatter_band_f32_to_host_f64(out_ptr, h_band.as_slice(), i0, bw, nsamp)
-                        };
+                        // FIX #1 again
+                        let h_slice: &[f32] = h_band
+                            .as_slice()
+                            .map_err(|e| anyhow::anyhow!(e))
+                            .context("PinnedHostSlice::as_slice failed (weighted)")?;
+
+                        unsafe { scatter_band_f32_to_host_f64(out_ptr, h_slice, i0, bw, nsamp) };
 
                         done_bi += 1;
                         if opts.progress_every > 0 && (done_bi % opts.progress_every == 0) {
@@ -804,7 +810,7 @@ pub fn unifrac_striped_weighted_gpu(
 }
 
 // ============================================================================
-//  CPU PHASES + STRIPE BUILDING
+//  CPU PHASES + STRIPE BUILDING (unchanged logic)
 // ============================================================================
 
 fn build_unweighted_node_bits_and_active(
