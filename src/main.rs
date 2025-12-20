@@ -55,8 +55,16 @@ use crate::stripe_cu::{
     unifrac_striped_weighted_gpu,
 };
 
-let use_gpu = cfg!(feature = "gpu")
-    && stripe_cu::device_count().unwrap_or(0) > 0;
+fn gpu_available() -> bool {
+    #[cfg(feature = "gpu")]
+    {
+        stripe_cu::device_count().unwrap_or(0) > 0
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        false
+    }
+}
 
 const UNIFRAC_CITATIONS: &str = r#"
 Citations:
@@ -1558,16 +1566,7 @@ fn main() -> Result<()> {
         .unwrap();
 
 
-    let use_gpu: bool = {
-        #[cfg(feature = "gpu")]
-        {
-            stripe_cu::device_count().unwrap_or(0) > 0
-        }
-        #[cfg(not(feature = "gpu"))]
-        {
-            false
-        }
-    };
+    let use_gpu = gpu_available();
 
     #[cfg(feature = "gpu")]
     let gpu_opts = GpuOptions {
