@@ -42,6 +42,22 @@ use succparen::{
 #[cfg(feature = "stdsimd")]
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 
+
+#[cfg(feature = "gpu")]
+mod stripe_cu;
+
+
+#[cfg(feature = "gpu")]
+use crate::stripe_cu::{
+    GpuOptions,
+    InputTable,
+    unifrac_striped_unweighted_gpu,
+    unifrac_striped_weighted_gpu,
+};
+
+let use_gpu = cfg!(feature = "gpu")
+    && stripe_cu::device_count().unwrap_or(0) > 0;
+
 const UNIFRAC_CITATIONS: &str = r#"
 Citations:
   For DartUniFrac/UniFrac, please see:
@@ -54,6 +70,8 @@ Citations:
     Chen et al. Bioinformatics 2012; DOI: 10.1093/bioinformatics/bts342
     Chang et al. BMC Bioinformatics 2011; DOI: 10.1186/1471-2105-12-118
 "#;
+
+
 
 
 // Plain new-type – automatically `Copy`.
@@ -1539,6 +1557,31 @@ fn main() -> Result<()> {
         .build_global()
         .unwrap();
 
+
+    let use_gpu: bool = {
+        #[cfg(feature = "gpu")]
+        {
+            stripe_cu::device_count().unwrap_or(0) > 0
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            false
+        }
+    };
+
+    #[cfg(feature = "gpu")]
+    let gpu_opts = GpuOptions {
+        devices: Vec::new(),   // empty => stripe_cu.rs auto-picks how many GPUs to use
+        block_rows: 512,
+        block_dim_x: 16,
+        block_dim_y: 16,
+    };
+
+    if use_gpu {
+        log::info!("CUDA detected -> using GPU striped implementation");
+    } else {
+        log::info!("No CUDA (or gpu feature off) -> using CPU striped implementation");
+    }
     // load tree
     let raw = std::fs::read_to_string(tree_file).context("read newick")?;
     let sanitized = sanitize_newick_drop_internal_labels_and_comments(&raw);
@@ -1789,17 +1832,38 @@ fn main() -> Result<()> {
                 v
             };
 
-            unifrac_striped_par_weighted(
-                &post,
-                &kids,
-                &lens,
-                &leaf_ids,
-                &row2leaf,
-                WeightedMode::Dense { counts: &counts },
-                nsamp,
-                &col_sums,
-                raw_counts,
-            )
+            if use_gpu && !raw_counts {
+                #[cfg(feature = "gpu")]
+                {
+                    let table = InputTable::DenseCounts(&counts);
+                    unifrac_striped_weighted_gpu(
+                        &kids,
+                        &lens,
+                        &leaf_ids,
+                        &row2leaf,
+                        table,
+                        nsamp,
+                        &col_sums,
+                        gpu_opts.clone(),
+                    )?
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    unreachable!()
+                }
+            } else {
+                unifrac_striped_par_weighted(
+                    &post,
+                    &kids,
+                    &lens,
+                    &leaf_ids,
+                    &row2leaf,
+                    WeightedMode::Dense { counts: &counts },
+                    nsamp,
+                    &col_sums,
+                    raw_counts,
+                )
+            }
         } else {
             let col_sums = if raw_counts {
                 vec![1.0f64; nsamp] // dummy; unused when raw_counts==true
@@ -1813,21 +1877,46 @@ fn main() -> Result<()> {
                 v
             };
 
-            unifrac_striped_par_weighted(
-                &post,
-                &kids,
-                &lens,
-                &leaf_ids,
-                &row2leaf,
-                WeightedMode::Csr {
-                    indptr: &indptr,
-                    indices: &indices,
-                    data: &data,
-                },
-                nsamp,
-                &col_sums,
-                raw_counts,
-            )
+            if use_gpu && !raw_counts {
+                #[cfg(feature = "gpu")]
+                {
+                    let table = InputTable::Csr {
+                        indptr: &indptr,
+                        indices: &indices,
+                        data: &data,
+                    };
+                    unifrac_striped_weighted_gpu(
+                        &kids,
+                        &lens,
+                        &leaf_ids,
+                        &row2leaf,
+                        table,
+                        nsamp,
+                        &col_sums,
+                        gpu_opts.clone(),
+                    )?
+                }
+                #[cfg(not(feature = "gpu"))]
+                {
+                    unreachable!()
+                }
+            } else {
+                unifrac_striped_par_weighted(
+                    &post,
+                    &kids,
+                    &lens,
+                    &leaf_ids,
+                    &row2leaf,
+                    WeightedMode::Csr {
+                        indptr: &indptr,
+                        indices: &indices,
+                        data: &data,
+                    },
+                    nsamp,
+                    &col_sums,
+                    raw_counts,
+                )
+            }
         }
     } else {
         // Unweighted
@@ -1857,7 +1946,25 @@ fn main() -> Result<()> {
                 }
             }
         }
-        unifrac_striped_par(&post, &kids, &lens, &leaf_ids, masks)
+        if use_gpu {
+            #[cfg(feature = "gpu")]
+            {
+                unifrac_striped_unweighted_gpu(
+                    &post,
+                    &kids,
+                    &lens,
+                    &leaf_ids,
+                    masks,
+                    gpu_opts.clone(),
+                )?
+            }
+            #[cfg(not(feature = "gpu"))]
+            {
+                unreachable!()
+            }
+        } else {
+            unifrac_striped_par(&post, &kids, &lens, &leaf_ids, masks)
+        }
     };
 
     // Free big structures early
