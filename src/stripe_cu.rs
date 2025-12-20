@@ -306,15 +306,17 @@ unsafe fn scatter_band_f32_to_host_f64(
     bw: usize,
     nsamp: usize,
 ) {
-    let base = out_ptr.as_mut_ptr();
-    for ii in 0..bw {
-        let i = i0 + ii;
-        let row = &band[ii * nsamp..(ii + 1) * nsamp];
-        // only upper triangle (j > i) is guaranteed computed; mirror it
-        for j in (i + 1)..nsamp {
-            let d = row[j] as f64;
-            *base.add(i * nsamp + j) = d;
-            *base.add(j * nsamp + i) = d;
+    // Rust 2024: even inside unsafe fn, raw pointer ops must be inside unsafe block.
+    unsafe {
+        let base = out_ptr.as_mut_ptr();
+        for ii in 0..bw {
+            let i = i0 + ii;
+            let row = &band[ii * nsamp..(ii + 1) * nsamp];
+            for j in (i + 1)..nsamp {
+                let d = row[j] as f64;
+                *base.add(i * nsamp + j) = d;
+                *base.add(j * nsamp + i) = d;
+            }
         }
     }
 }
@@ -407,7 +409,6 @@ pub fn unifrac_striped_unweighted_gpu(
                             continue;
                         }
 
-                        // For this bi, compute all bj >= bi into d_band
                         for bj in bi..nblk {
                             let j0 = bj * blk;
                             let j1 = ((bj + 1) * blk).min(nsamp);
@@ -490,11 +491,13 @@ pub fn unifrac_striped_unweighted_gpu(
                             unsafe { launch.launch(cfg) }?;
                         }
 
-                        // Copy back once for this bi
                         stream.synchronize()?;
                         stream.memcpy_dtoh(&d_band, &mut h_band)?;
 
-                        unsafe { scatter_band_f32_to_host_f64(out_ptr, &h_band, i0, bw, nsamp) };
+                        // FIX: PinnedHostSlice -> &[f32]
+                        unsafe {
+                            scatter_band_f32_to_host_f64(out_ptr, h_band.as_slice(), i0, bw, nsamp)
+                        };
 
                         done_bi += 1;
                         if opts.progress_every > 0 && (done_bi % opts.progress_every == 0) {
@@ -607,7 +610,7 @@ pub fn unifrac_striped_weighted_gpu(
         _ => None,
     };
 
-    // Precompute stripe per block-row once (big win vs per-tile building)
+    // Precompute stripe per block-row once
     let t_pre = Instant::now();
     let stripes: Vec<Stripe> = (0..nblk)
         .into_par_iter()
@@ -666,7 +669,6 @@ pub fn unifrac_striped_weighted_gpu(
                         .load_function("unifrac_weighted_tile_f32_to_band")
                         .context("load kernel unifrac_weighted_tile_f32_to_band")?;
 
-                    // Device band buffer and pinned host band
                     let band_elems = blk * nsamp;
                     let mut d_band: CudaSlice<f32> = stream.alloc_zeros(band_elems)?;
                     let mut h_band: PinnedHostSlice<f32> = ctx.alloc_pinned(band_elems)?;
@@ -687,7 +689,6 @@ pub fn unifrac_striped_weighted_gpu(
 
                         let stripe_i = &stripes[bi];
 
-                        // Compute all bj >= bi tiles into d_band
                         for bj in bi..nblk {
                             let j0 = bj * blk;
                             let j1 = ((bj + 1) * blk).min(nsamp);
@@ -698,7 +699,6 @@ pub fn unifrac_striped_weighted_gpu(
 
                             let stripe_j = &stripes[bj];
 
-                            // Union nodes
                             let mut nodes_u = Vec::<usize>::with_capacity(
                                 stripe_i.nodes.len() + stripe_j.nodes.len(),
                             );
@@ -710,7 +710,6 @@ pub fn unifrac_striped_weighted_gpu(
                                 continue;
                             }
 
-                            // Pack rows aligned to nodes_u
                             let mut rows_a = vec![0.0f32; nodes_u.len() * bw];
                             let mut rows_b = vec![0.0f32; nodes_u.len() * bh];
                             let mut lens_v = vec![0.0f32; nodes_u.len()];
@@ -769,11 +768,13 @@ pub fn unifrac_striped_weighted_gpu(
                             unsafe { launch.launch(cfg) }?;
                         }
 
-                        // Copy back once for this block-row
                         stream.synchronize()?;
                         stream.memcpy_dtoh(&d_band, &mut h_band)?;
 
-                        unsafe { scatter_band_f32_to_host_f64(out_ptr, &h_band, i0, bw, nsamp) };
+                        // FIX: PinnedHostSlice -> &[f32]
+                        unsafe {
+                            scatter_band_f32_to_host_f64(out_ptr, h_band.as_slice(), i0, bw, nsamp)
+                        };
 
                         done_bi += 1;
                         if opts.progress_every > 0 && (done_bi % opts.progress_every == 0) {
@@ -803,7 +804,7 @@ pub fn unifrac_striped_weighted_gpu(
 }
 
 // ============================================================================
-//  CPU PHASES + STRIPE BUILDING (unchanged logic)
+//  CPU PHASES + STRIPE BUILDING
 // ============================================================================
 
 fn build_unweighted_node_bits_and_active(
