@@ -25,7 +25,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-
+use cudarc::driver::PushKernelArg;
 
 #[derive(Clone, Debug)]
 pub struct GpuOptions {
