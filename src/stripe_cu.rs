@@ -27,8 +27,6 @@ use std::thread;
 use std::time::Instant;
 use cudarc::driver::PushKernelArg;
 
-use std::ptr::NonNull;
-
 // Plain new-type – automatically Copy.
 #[derive(Clone, Copy)]
 struct DistPtr(NonNull<f64>);
@@ -704,13 +702,9 @@ void unifrac_weighted_tile_f32(
 }
 "#;
 
-// ------------------------- Internals -------------------------
 
-// Plain new-type pointer, Send+Sync by construction (disjoint tiles).
-#[derive(Clone, Copy)]
-struct DistPtr(NonNull<f64>);
-unsafe impl Send for DistPtr {}
-unsafe impl Sync for DistPtr {}
+
+
 
 /// AUTO GPU selection heuristic:
 /// - never use more GPUs than tiles
