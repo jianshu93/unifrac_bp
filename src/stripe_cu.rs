@@ -27,6 +27,17 @@ use std::thread;
 use std::time::Instant;
 use cudarc::driver::PushKernelArg;
 
+use std::ptr::NonNull;
+
+// Plain new-type – automatically Copy.
+#[derive(Clone, Copy)]
+struct DistPtr(NonNull<f64>);
+
+// We guarantee in the algorithm that each thread/GPU writes a disjoint
+// region of the matrix, so sharing the raw pointer is safe.
+unsafe impl Send for DistPtr {}
+unsafe impl Sync for DistPtr {}
+
 #[derive(Clone, Debug)]
 pub struct GpuOptions {
     /// If empty => AUTO select a subset of visible CUDA devices.
@@ -95,7 +106,7 @@ pub fn unifrac_striped_unweighted_gpu(
         .collect();
 
     let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
-    let out_ptr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
+    let out_ptr: DistPtr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
     let devices = pick_devices(&opts, pairs.len())?;
     if devices.is_empty() {
