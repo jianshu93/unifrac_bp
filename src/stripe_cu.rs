@@ -31,6 +31,13 @@ use cudarc::driver::PushKernelArg;
 #[derive(Clone, Copy)]
 struct DistPtr(NonNull<f64>);
 
+impl DistPtr {
+    #[inline]
+    fn as_mut_ptr(self) -> *mut f64 {
+        self.0.as_ptr()
+    }
+}
+
 // We guarantee in the algorithm that each thread/GPU writes a disjoint
 // region of the matrix, so sharing the raw pointer is safe.
 unsafe impl Send for DistPtr {}
@@ -252,7 +259,7 @@ pub fn unifrac_striped_unweighted_gpu(
 
                         // Scatter to host output matrix (upper + mirror)
                         unsafe {
-                            let base = out_ptr.0.as_ptr();
+                            let base = out_ptr.as_mut_ptr();
                             for ii in 0..bw {
                                 let i = i0 + ii;
                                 for jj in 0..bh {
@@ -561,7 +568,7 @@ pub fn unifrac_striped_weighted_gpu(
 
                         // Scatter
                         unsafe {
-                            let base = out_ptr.0.as_ptr();
+                            let base = out_ptr.as_mut_ptr();
                             for ii in 0..bw {
                                 let i = i0 + ii;
                                 for jj in 0..bh {
