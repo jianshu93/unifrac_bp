@@ -1574,6 +1574,7 @@ fn main() -> Result<()> {
         block_rows: 512,
         block_dim_x: 16,
         block_dim_y: 16,
+        progress_every: 8,
     };
 
     if use_gpu {
