@@ -19,6 +19,7 @@
 use anyhow::{bail, Context, Result};
 use bitvec::{order::Lsb0, vec::BitVec};
 use cudarc::driver::{CudaContext, CudaSlice, LaunchConfig, PinnedHostSlice};
+use cudarc::driver::PushKernelArg;
 use cudarc::nvrtc::compile_ptx;
 use log::info;
 use rayon::prelude::*;
@@ -26,7 +27,6 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
-use cudarc::driver::PushKernelArg;
 
 // ------------------------- raw output pointer wrapper -------------------------
 
@@ -142,7 +142,6 @@ void unifrac_unweighted_tile_u64_to_band(
     float d = 0.0f;
     if (u > 0.0f) d = 1.0f - (s / u);
 
-    // band row is local ii (0..bw), col is global gj
     band[(size_t)ii * (size_t)n + (size_t)gj] = d;
 }
 
@@ -185,7 +184,7 @@ void unifrac_weighted_tile_f32_to_band(
 
         float m = (a < b) ? a : b;
         den += len * s;
-        num += len * (s - 2.0f * m); // len*|a-b|
+        num += len * (s - 2.0f * m);
     }
 
     float d = 0.0f;
@@ -301,12 +300,11 @@ fn extract_words_into(raw: &[u64], start_bit: usize, len_bits: usize, dst: &mut 
 
 unsafe fn scatter_band_f32_to_host_f64(
     out_ptr: DistPtr,
-    band: &[f32], // length = blk * nsamp (or >= bw*nsamp)
+    band: &[f32],
     i0: usize,
     bw: usize,
     nsamp: usize,
 ) {
-    // Rust 2024: raw pointer ops must be inside an explicit unsafe block.
     unsafe {
         let base = out_ptr.as_mut_ptr();
         for ii in 0..bw {
@@ -339,7 +337,6 @@ pub fn unifrac_striped_unweighted_gpu(
         return Ok(Vec::new());
     }
 
-    // Phase 1/2 CPU
     let (node_bits, active_per_strip, blk) =
         build_unweighted_node_bits_and_active(post, kids, lens, leaf_ids, masks)?;
 
@@ -365,7 +362,6 @@ pub fn unifrac_striped_unweighted_gpu(
         devices
     );
 
-    // shared read-only
     let node_bits = Arc::new(node_bits);
     let active_per_strip = Arc::new(active_per_strip);
     let lens_arc = Arc::new(lens.to_vec());
@@ -389,14 +385,13 @@ pub fn unifrac_striped_unweighted_gpu(
                         .load_function("unifrac_unweighted_tile_u64_to_band")
                         .context("load kernel unifrac_unweighted_tile_u64_to_band")?;
 
-                    // Device band buffer (blk x nsamp) and pinned host band
                     let band_elems = blk * nsamp;
                     let mut d_band: CudaSlice<f32> = stream.alloc_zeros(band_elems)?;
-                    let mut h_band: PinnedHostSlice<f32> = ctx.alloc_pinned(band_elems)?;
+                    // FIX: alloc_pinned is unsafe in your cudarc
+                    let mut h_band: PinnedHostSlice<f32> = unsafe { ctx.alloc_pinned(band_elems)? };
 
                     let mut done_bi = 0usize;
 
-                    // block-row ownership
                     for bi in 0..nblk {
                         if bi % ng != widx {
                             continue;
@@ -494,7 +489,6 @@ pub fn unifrac_striped_unweighted_gpu(
                         stream.synchronize()?;
                         stream.memcpy_dtoh(&d_band, &mut h_band)?;
 
-                        // FIX #1: as_slice() returns Result<_, DriverError> on your cudarc
                         let h_slice: &[f32] = h_band
                             .as_slice()
                             .map_err(|e| anyhow::anyhow!(e))
@@ -553,7 +547,6 @@ pub fn unifrac_striped_weighted_gpu(
 
     let total = lens.len();
 
-    // parent[]
     let parent: Vec<usize> = {
         let mut p = vec![usize::MAX; total];
         for v in 0..total {
@@ -592,14 +585,12 @@ pub fn unifrac_striped_weighted_gpu(
         devices
     );
 
-    // Share read-only
     let parent = Arc::new(parent);
     let lens = Arc::new(lens.to_vec());
     let leaf_ids = Arc::new(leaf_ids.to_vec());
     let row2leaf = Arc::new(row2leaf.to_vec());
     let col_sums = Arc::new(col_sums.to_vec());
 
-    // Share table
     let dense_counts: Option<Arc<Vec<Vec<f64>>>> = match table {
         InputTable::DenseCounts(c) => Some(Arc::new(c.to_vec())),
         _ => None,
@@ -613,7 +604,6 @@ pub fn unifrac_striped_weighted_gpu(
         _ => None,
     };
 
-    // Precompute stripe per block-row once
     let t_pre = Instant::now();
     let stripes: Vec<Stripe> = (0..nblk)
         .into_par_iter()
@@ -674,7 +664,8 @@ pub fn unifrac_striped_weighted_gpu(
 
                     let band_elems = blk * nsamp;
                     let mut d_band: CudaSlice<f32> = stream.alloc_zeros(band_elems)?;
-                    let mut h_band: PinnedHostSlice<f32> = ctx.alloc_pinned(band_elems)?;
+                    // FIX: alloc_pinned is unsafe in your cudarc
+                    let mut h_band: PinnedHostSlice<f32> = unsafe { ctx.alloc_pinned(band_elems)? };
 
                     let mut done_bi = 0usize;
 
@@ -774,7 +765,6 @@ pub fn unifrac_striped_weighted_gpu(
                         stream.synchronize()?;
                         stream.memcpy_dtoh(&d_band, &mut h_band)?;
 
-                        // FIX #1 again
                         let h_slice: &[f32] = h_band
                             .as_slice()
                             .map_err(|e| anyhow::anyhow!(e))
@@ -810,7 +800,7 @@ pub fn unifrac_striped_weighted_gpu(
 }
 
 // ============================================================================
-//  CPU PHASES + STRIPE BUILDING (unchanged logic)
+//  CPU PHASES + STRIPE BUILDING
 // ============================================================================
 
 fn build_unweighted_node_bits_and_active(
@@ -1007,7 +997,8 @@ fn build_stripe_dense(
 
             let mut v = v_leaf;
             loop {
-                let (_row_idx, row) = ensure_row_slot(v, &mut idx_of, &mut nodes, &mut rows, width);
+                let (_row_idx, row) =
+                    ensure_row_slot(v, &mut idx_of, &mut nodes, &mut rows, width);
                 row[s - s0] += inc;
                 let p = parent[v];
                 if p == usize::MAX {
@@ -1061,7 +1052,8 @@ fn build_stripe_csr(
 
             let mut v = v_leaf;
             loop {
-                let (_row_idx, row) = ensure_row_slot(v, &mut idx_of, &mut nodes, &mut rows, width);
+                let (_row_idx, row) =
+                    ensure_row_slot(v, &mut idx_of, &mut nodes, &mut rows, width);
                 row[s - s0] += inc;
                 let p = parent[v];
                 if p == usize::MAX {
