@@ -991,13 +991,13 @@ impl Stripe {
     }
 }
 
-fn ensure_row_slot(
+fn ensure_row_slot<'a>(
     v: usize,
     idx_of: &mut [u32],
     nodes: &mut Vec<usize>,
-    rows: &mut Vec<Vec<f32>>,
+    rows: &'a mut Vec<Vec<f32>>,
     width: usize,
-) -> (usize, &mut [f32]) {
+) -> (usize, &'a mut [f32]) {
     let idx = idx_of[v];
     if idx != u32::MAX {
         let i = idx as usize;
