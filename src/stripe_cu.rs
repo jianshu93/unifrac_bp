@@ -449,7 +449,7 @@ pub fn unifrac_striped_weighted_gpu(
     let skipped_singletons = active_counts
         .iter()
         .enumerate()
-        .filter(|(v, &&cnt)| cnt == 1 && lens_f32[*v] > 0.0)
+        .filter(|(v, &cnt)| cnt == 1 && lens_f32[*v] > 0.0)
         .count();
 
     let branch_batch: usize = std::env::var("UNIFRAC_CUDA_BRANCH_BATCH")
