@@ -3,11 +3,11 @@
 //!
 //! This version:
 //! - Keeps the existing unweighted tile kernel.
-//! - Uses a weighted normalized CUDA kernel based on the min-sum identity:
+//! - Uses a weighted normalized CUDA path based on diagonal distance stripes and branch batches.
+//! - Avoids sparse atomics and avoids per-rectangular-tile row-map rebuild/copy.
+//! - Uses the min-sum identity:
 //!     den(i,j) = sample_sum[i] + sample_sum[j]
 //!     d(i,j) = 1 - 2 * sum_v(len[v] * min(p[v,i], p[v,j])) / den(i,j)
-//! - Avoids the previous sparse-atomic weighted prototype.
-//! - Reuses per-worker device buffers for common-node ids and row maps.
 //!
 //! NOTE:
 //! - Requires `--features cuda` and `cudarc`.
@@ -313,6 +313,8 @@ pub fn unifrac_striped_weighted_gpu(
         p
     };
 
+    // This block size is only used for the one-time branch embedding build.
+    // The weighted CUDA compute below is diagonal-stripe based, not rectangular-tile based.
     let blk = opts
         .block_rows
         .max(1)
@@ -321,32 +323,25 @@ pub fn unifrac_striped_weighted_gpu(
         .clamp(64, 4096);
     let nblk = (nsamp + blk - 1) / blk;
 
-    let pairs: Vec<(usize, usize)> = (0..nblk)
-        .flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj)))
-        .collect();
-
-    let devices = pick_devices(&opts, pairs.len())?;
+    let devices = pick_devices(&opts, nsamp.saturating_sub(1))?;
     if devices.is_empty() {
         bail!("GPU requested but no CUDA devices available");
     }
 
     info!(
-        "GPU(weighted minsum): nsamp={} blk={} nblk={} tiles={} visible_gpus={} using_gpus={:?}",
+        "GPU(weighted diagonal): nsamp={} embed_blk={} nblk={} diag_stripes={} visible_gpus={} using_gpus={:?}",
         nsamp,
         blk,
         nblk,
-        pairs.len(),
+        nsamp.saturating_sub(1),
         device_count().unwrap_or(0),
         devices
     );
 
-    let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
-    let out_ptr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
-
-    // Compile PTX once
+    // Compile PTX once.
     let ptx = Arc::new(compile_ptx(KERNEL_SRC).context("nvrtc compile PTX")?);
 
-    // Share table
+    // Share table.
     let dense_counts: Option<Arc<Vec<Vec<f64>>>> = match table {
         InputTable::DenseCounts(c) => Some(Arc::new(c.to_vec())),
         _ => None,
@@ -367,15 +362,14 @@ pub fn unifrac_striped_weighted_gpu(
         bail!("invalid table mode");
     }
 
-    // Share read-only
     let parent = Arc::new(parent);
     let leaf_ids = Arc::new(leaf_ids.to_vec());
     let row2leaf = Arc::new(row2leaf.to_vec());
     let col_sums = Arc::new(col_sums.to_vec());
     let lens_f32 = Arc::new(lens.to_vec());
 
-    // Precompute sample stripes.  Each stripe stores branch rows in dense
-    // branch-major layout for that sample block, plus a node-id -> row map.
+    // Build sample stripes once on CPU.  These are used only to assemble branch batches;
+    // the GPU compute itself does not revisit rectangular stripe pairs.
     let t_stripes = Instant::now();
     let stripes: Vec<Stripe> = (0..nblk)
         .into_par_iter()
@@ -412,212 +406,207 @@ pub fn unifrac_striped_weighted_gpu(
         .collect();
 
     info!(
-        "GPU(weighted minsum): precomputed {} stripes in {} ms",
+        "GPU(weighted diagonal): precomputed {} embedding stripes in {} ms",
         nblk,
         t_stripes.elapsed().as_millis()
     );
 
-    // Precompute denominator half: sample_sum[s] = Σ_v len[v] * p[v,s].
-    // Then den(i,j) = sample_sum[i] + sample_sum[j].
+    // Active positive-length nodes, and sample_sums[s] = Σ_v len[v] * p[v,s].
+    // The final denominator is den(i,j) = sample_sums[i] + sample_sums[j].
+    let mut active = vec![false; total];
     let mut sample_sums = vec![0.0f32; nsamp];
     for (bi, stripe) in stripes.iter().enumerate() {
         let s0 = bi * blk;
         let width = stripe.width;
         for (ri, &nid) in stripe.nodes.iter().enumerate() {
-            let len = lens_f32[nid as usize];
+            let v = nid as usize;
+            let len = lens_f32[v];
             if len <= 0.0 {
                 continue;
             }
+            active[v] = true;
             let row0 = ri * width;
             for c in 0..width {
-                let v = stripe.rows[row0 + c];
-                if v != 0.0 {
-                    sample_sums[s0 + c] += len * v;
+                let x = stripe.rows[row0 + c];
+                if x != 0.0 {
+                    sample_sums[s0 + c] += len * x;
                 }
             }
         }
     }
 
-    let stripes = Arc::new(stripes);
-    let sample_sums = Arc::new(sample_sums);
-    let pairs = Arc::new(pairs);
+    let active_nodes: Vec<u32> = active
+        .iter()
+        .enumerate()
+        .filter_map(|(v, &a)| {
+            if a && lens_f32[v] > 0.0 {
+                Some(v as u32)
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    // Bound reusable node/map buffers by the largest stripe node list.
-    let global_max_nodes = stripes.iter().map(|s| s.nodes.len()).max().unwrap_or(0).max(1);
-    let ng = devices.len();
-
-    thread::scope(|scope| {
-        for (widx, &dev_id) in devices.iter().enumerate() {
-            let stripes = Arc::clone(&stripes);
-            let lens_f32 = Arc::clone(&lens_f32);
-            let sample_sums = Arc::clone(&sample_sums);
-            let pairs = Arc::clone(&pairs);
-            let ptx = Arc::clone(&ptx);
-            let out_ptr = out_ptr;
-
-            scope.spawn(move || {
-                let inner = || -> Result<()> {
-                    let ctx = CudaContext::new(dev_id)?;
-                    let stream = ctx.default_stream();
-
-                    let module = ctx.load_module((*ptx).clone())?;
-                    let f_w = module
-                        .load_function("unifrac_weighted_tile_minsum_f32")
-                        .context("load kernel unifrac_weighted_tile_minsum_f32")?;
-
-                    // Upload global arrays once per worker/GPU.
-                    let d_lens_all: CudaSlice<f32> = stream.clone_htod(lens_f32.as_slice())?;
-                    let d_sample_sums: CudaSlice<f32> = stream.clone_htod(sample_sums.as_slice())?;
-
-                    // Tile output buffer (reused)
-                    let max_elems = blk * blk;
-                    let mut d_out: CudaSlice<f32> = stream.alloc_zeros(max_elems)?;
-                    let mut h_out = vec![0.0f32; max_elems];
-
-                    // Cache uploaded stripe rows.  This avoids re-uploading stripe_i
-                    // through all bj for the common single-GPU case while keeping memory
-                    // bounded for large trees.
-                    let mut cached_i: Option<(usize, CudaSlice<f32>, usize)> = None;
-                    let mut cached_j: Option<(usize, CudaSlice<f32>, usize)> = None;
-
-                    // Reusable device buffers for common node ids + row maps.
-                    let mut d_common: CudaSlice<u32> = stream.alloc_zeros(global_max_nodes)?;
-                    let mut d_map_i: CudaSlice<i32> = stream.alloc_zeros(global_max_nodes)?;
-                    let mut d_map_j: CudaSlice<i32> = stream.alloc_zeros(global_max_nodes)?;
-
-                    let mut h_common: Vec<u32> = Vec::with_capacity(global_max_nodes);
-                    let mut h_map_i: Vec<i32> = Vec::with_capacity(global_max_nodes);
-                    let mut h_map_j: Vec<i32> = Vec::with_capacity(global_max_nodes);
-
-                    let mut tiles_done = 0usize;
-                    let tiles_total = pairs
-                        .iter()
-                        .enumerate()
-                        .filter(|(tix, _)| tix % ng == widx)
-                        .count();
-
-                    for (tix, &(bi, bj)) in pairs.iter().enumerate() {
-                        if tix % ng != widx {
-                            continue;
-                        }
-
-                        let stripe_i = &stripes[bi];
-                        let stripe_j = &stripes[bj];
-                        let bw = stripe_i.width;
-                        let bh = stripe_j.width;
-                        if bw == 0 || bh == 0 {
-                            continue;
-                        }
-
-                        let d_rows_i_ref = match &cached_i {
-                            Some((cbi, d, w)) if *cbi == bi && *w == bw => d,
-                            _ => {
-                                let d: CudaSlice<f32> = stream.clone_htod(stripe_i.rows.as_slice())?;
-                                cached_i = Some((bi, d, bw));
-                                &cached_i.as_ref().unwrap().1
-                            }
-                        };
-
-                        let d_rows_j_ref = match &cached_j {
-                            Some((cbj, d, w)) if *cbj == bj && *w == bh => d,
-                            _ => {
-                                let d: CudaSlice<f32> = stream.clone_htod(stripe_j.rows.as_slice())?;
-                                cached_j = Some((bj, d, bh));
-                                &cached_j.as_ref().unwrap().1
-                            }
-                        };
-
-                        h_common.clear();
-                        h_map_i.clear();
-                        h_map_j.clear();
-
-                        merge_intersection_u32_into(&stripe_i.nodes, &stripe_j.nodes, &mut h_common);
-                        if h_common.len() > global_max_nodes {
-                            bail!(
-                                "internal: common len {} > global_max_nodes {}",
-                                h_common.len(),
-                                global_max_nodes
-                            );
-                        }
-
-                        for &nid in &h_common {
-                            let v = nid as usize;
-                            let ri = stripe_i.index[v];
-                            let rj = stripe_j.index[v];
-                            debug_assert!(ri != u32::MAX && rj != u32::MAX);
-                            h_map_i.push(ri as i32);
-                            h_map_j.push(rj as i32);
-                        }
-
-                        if !h_common.is_empty() {
-                            stream.memcpy_htod(&h_common, &mut d_common)?;
-                            stream.memcpy_htod(&h_map_i, &mut d_map_i)?;
-                            stream.memcpy_htod(&h_map_j, &mut d_map_j)?;
-                        }
-
-                        let i0 = bi * blk;
-                        let j0 = bj * blk;
-                        let num_common_i32 = h_common.len() as i32;
-                        let bw_i32 = bw as i32;
-                        let bh_i32 = bh as i32;
-                        let i0_i32 = i0 as i32;
-                        let j0_i32 = j0 as i32;
-                        let only_upper_i32 = if bi == bj { 1i32 } else { 0i32 };
-
-                        let cfg = LaunchConfig {
-                            grid_dim: (
-                                ((bh as u32 + opts.block_dim_x - 1) / opts.block_dim_x),
-                                ((bw as u32 + opts.block_dim_y - 1) / opts.block_dim_y),
-                                1,
-                            ),
-                            block_dim: (opts.block_dim_x, opts.block_dim_y, 1),
-                            shared_mem_bytes: 0,
-                        };
-
-                        let mut launch = stream.launch_builder(&f_w);
-                        launch.arg(d_rows_i_ref);
-                        launch.arg(d_rows_j_ref);
-                        launch.arg(&d_lens_all);
-                        launch.arg(&d_sample_sums);
-                        launch.arg(&d_common);
-                        launch.arg(&d_map_i);
-                        launch.arg(&d_map_j);
-                        launch.arg(&num_common_i32);
-                        launch.arg(&bw_i32);
-                        launch.arg(&bh_i32);
-                        launch.arg(&i0_i32);
-                        launch.arg(&j0_i32);
-                        launch.arg(&only_upper_i32);
-                        launch.arg(&mut d_out);
-
-                        unsafe { launch.launch(cfg) }?;
-                        stream.memcpy_dtoh(&d_out, &mut h_out)?;
-
-                        unsafe {
-                            see_scatter_tile_to_host(out_ptr, &h_out, nsamp, i0, j0, bw, bh);
-                        }
-
-                        tiles_done += 1;
-                        if (tiles_done & 31) == 0 {
-                            info!(
-                                "GPU(weighted minsum): dev={} worker={} progress {}/{} tiles",
-                                dev_id, widx, tiles_done, tiles_total
-                            );
-                        }
-                    }
-
-                    Ok(())
-                };
-
-                if let Err(e) = inner() {
-                    panic!("GPU worker dev={} failed: {e:?}", dev_id);
-                }
-            });
-        }
-    });
+    let branch_batch: usize = std::env::var("UNIFRAC_CUDA_BRANCH_BATCH")
+        .ok()
+        .and_then(|x| x.parse::<usize>().ok())
+        .unwrap_or(2048)
+        .clamp(64, 16384);
 
     info!(
-        "GPU(weighted minsum): total wall time {} ms",
+        "GPU(weighted diagonal): active positive branches={} branch_batch={}",
+        active_nodes.len(),
+        branch_batch
+    );
+
+    let stripes = Arc::new(stripes);
+    let active_nodes = Arc::new(active_nodes);
+    let sample_sums = Arc::new(sample_sums);
+    let lens_f32 = Arc::clone(&lens_f32);
+
+    // One full float matrix on device accumulates shared min-sums over branch batches.
+    // This intentionally trades GPU memory for avoiding per-tile branch/row-map copies.
+    // For 25,145 samples this is ~2.53 GB as f32.
+    let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
+    let out_ptr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
+
+    // Current implementation uses one GPU for the full resident matrix.  Multiple GPUs can be
+    // added later by splitting diagonal ranges, but this version avoids inter-GPU reduction.
+    let dev_id = devices[0];
+    let ctx = CudaContext::new(dev_id)?;
+    let stream = ctx.default_stream();
+    let module = ctx.load_module((*ptx).clone())?;
+    let f_accum = module
+        .load_function("unifrac_weighted_diag_accum_minsum_f32")
+        .context("load kernel unifrac_weighted_diag_accum_minsum_f32")?;
+    let f_norm = module
+        .load_function("unifrac_weighted_diag_normalize_f32")
+        .context("load kernel unifrac_weighted_diag_normalize_f32")?;
+
+    let matrix_elems = nsamp
+        .checked_mul(nsamp)
+        .context("nsamp*nsamp overflow for weighted GPU matrix")?;
+    let mut d_shared: CudaSlice<f32> = stream.alloc_zeros(matrix_elems)?;
+    let d_sample_sums: CudaSlice<f32> = stream.clone_htod(sample_sums.as_slice())?;
+
+    let n_i32 = nsamp as i32;
+    let block_x = opts.block_dim_x.max(1);
+    let block_y = opts.block_dim_y.max(1);
+    let diag_count = nsamp.saturating_sub(1) as u32;
+
+    // Process branch batches.  Each batch is materialized as dense branch-major
+    // [batch_nodes x nsamp] only once, uploaded, and then used by a diagonal-pair kernel.
+    let t_batches = Instant::now();
+    let nbatches = (active_nodes.len() + branch_batch - 1) / branch_batch;
+
+    for b0 in (0..active_nodes.len()).step_by(branch_batch) {
+        let b1 = (b0 + branch_batch).min(active_nodes.len());
+        let cur = b1 - b0;
+        let batch_id = b0 / branch_batch + 1;
+
+        let mut h_emb = vec![0.0f32; cur * nsamp];
+        let mut h_lens = vec![0.0f32; cur];
+        let mut h_sample_has_batch = vec![0u8; nsamp];
+
+        // Map global node id -> local batch row.
+        let mut local_of = vec![u32::MAX; total];
+        for (local, &nid) in active_nodes[b0..b1].iter().enumerate() {
+            let v = nid as usize;
+            local_of[v] = local as u32;
+            h_lens[local] = lens_f32[v];
+        }
+
+        // Assemble dense embedded branch batch from the one-time CPU stripes.
+        for (bi, stripe) in stripes.iter().enumerate() {
+            let s0 = bi * blk;
+            let width = stripe.width;
+            for (ri, &nid) in stripe.nodes.iter().enumerate() {
+                let local = local_of[nid as usize];
+                if local == u32::MAX {
+                    continue;
+                }
+                let local = local as usize;
+                let src0 = ri * width;
+                let dst0 = local * nsamp + s0;
+                h_emb[dst0..dst0 + width].copy_from_slice(&stripe.rows[src0..src0 + width]);
+                for c in 0..width {
+                    if stripe.rows[src0 + c] > 0.0 {
+                        h_sample_has_batch[s0 + c] = 1;
+                    }
+                }
+            }
+        }
+
+        let d_emb: CudaSlice<f32> = stream.clone_htod(h_emb.as_slice())?;
+        let d_lens_batch: CudaSlice<f32> = stream.clone_htod(h_lens.as_slice())?;
+        let d_sample_has_batch: CudaSlice<u8> = stream.clone_htod(h_sample_has_batch.as_slice())?;
+
+        let cur_i32 = cur as i32;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                ((nsamp as u32 + block_x - 1) / block_x),
+                ((diag_count + block_y - 1) / block_y),
+                1,
+            ),
+            block_dim: (block_x, block_y, 1),
+            shared_mem_bytes: 0,
+        };
+
+        let mut launch = stream.launch_builder(&f_accum);
+        launch.arg(&d_emb);
+        launch.arg(&d_lens_batch);
+        launch.arg(&d_sample_has_batch);
+        launch.arg(&cur_i32);
+        launch.arg(&n_i32);
+        launch.arg(&mut d_shared);
+        unsafe { launch.launch(cfg) }?;
+
+        if batch_id == 1 || batch_id == nbatches || (batch_id & 7) == 0 {
+            info!(
+                "GPU(weighted diagonal): processed branch batch {}/{} ({} branches)",
+                batch_id,
+                nbatches,
+                cur
+            );
+        }
+    }
+
+    info!(
+        "GPU(weighted diagonal): accumulated branch batches in {} ms",
+        t_batches.elapsed().as_millis()
+    );
+
+    // Convert shared min-sums into distances in-place in d_shared upper triangle.
+    let cfg_norm = LaunchConfig {
+        grid_dim: (
+            ((nsamp as u32 + block_x - 1) / block_x),
+            ((diag_count + block_y - 1) / block_y),
+            1,
+        ),
+        block_dim: (block_x, block_y, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut launch = stream.launch_builder(&f_norm);
+    launch.arg(&d_sample_sums);
+    launch.arg(&n_i32);
+    launch.arg(&mut d_shared);
+    unsafe { launch.launch(cfg_norm) }?;
+
+    // Copy the upper-triangular f32 result back and scatter to symmetric f64 host output.
+    let t_copy = Instant::now();
+    let mut h_mat = vec![0.0f32; matrix_elems];
+    stream.memcpy_dtoh(&d_shared, &mut h_mat)?;
+    unsafe {
+        scatter_upper_matrix_to_host(out_ptr, &h_mat, nsamp);
+    }
+    drop(h_mat);
+
+    info!(
+        "GPU(weighted diagonal): copied/scattered output in {} ms",
+        t_copy.elapsed().as_millis()
+    );
+    info!(
+        "GPU(weighted diagonal): total wall time {} ms",
         t_all.elapsed().as_millis()
     );
 
@@ -735,6 +724,62 @@ void unifrac_weighted_tile_minsum_f32(
     }
     out[(size_t)ii * (size_t)bh + (size_t)jj] = d;
 }
+
+
+extern "C" __global__
+void unifrac_weighted_diag_accum_minsum_f32(
+    const float* __restrict__ emb,          // [num_nodes * n], branch-major
+    const float* __restrict__ lens_batch,   // [num_nodes]
+    const unsigned char* __restrict__ sample_has_batch, // [n], 1 if sample has any nonzero in this branch batch
+    int num_nodes,
+    int n,
+    float* __restrict__ shared              // [n * n], upper triangle accumulated min-sum
+){
+    int k = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int d = (int)(blockIdx.y * blockDim.y + threadIdx.y) + 1;
+    if (k >= n || d >= n) return;
+
+    int l = k + d;
+    if (l >= n) return;
+    if (sample_has_batch[(size_t)k] == 0 || sample_has_batch[(size_t)l] == 0) return;
+
+    float acc = 0.0f;
+    for (int r = 0; r < num_nodes; ++r) {
+        float len = lens_batch[(size_t)r];
+        if (len <= 0.0f) continue;
+        size_t base = (size_t)r * (size_t)n;
+        float a = emb[base + (size_t)k];
+        float b = emb[base + (size_t)l];
+        float m = a < b ? a : b;
+        if (m > 0.0f) acc += len * m;
+    }
+
+    shared[(size_t)k * (size_t)n + (size_t)l] += acc;
+}
+
+extern "C" __global__
+void unifrac_weighted_diag_normalize_f32(
+    const float* __restrict__ sample_sums,
+    int n,
+    float* __restrict__ shared_as_dist      // input: shared min-sum, output: distance
+){
+    int k = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int d = (int)(blockIdx.y * blockDim.y + threadIdx.y) + 1;
+    if (k >= n || d >= n) return;
+
+    int l = k + d;
+    if (l >= n) return;
+
+    size_t idx = (size_t)k * (size_t)n + (size_t)l;
+    float den = sample_sums[(size_t)k] + sample_sums[(size_t)l];
+    float val = 0.0f;
+    if (den > 0.0f) {
+        val = 1.0f - (2.0f * shared_as_dist[idx] / den);
+        if (val < 0.0f) val = 0.0f;
+        if (val > 1.0f) val = 1.0f;
+    }
+    shared_as_dist[idx] = val;
+}
 "#;
 
 // GPU selection
@@ -799,6 +844,26 @@ unsafe fn see_scatter_tile_to_host(
             unsafe {
                 *base.add(gi * nsamp + gj) = d;
                 *base.add(gj * nsamp + gi) = d;
+            }
+        }
+    }
+}
+
+
+#[inline(always)]
+unsafe fn scatter_upper_matrix_to_host(
+    out_ptr: DistPtr,
+    h_mat: &[f32],
+    nsamp: usize,
+) {
+    let base = out_ptr.as_mut_ptr();
+    for i in 0..nsamp {
+        let row0 = i * nsamp;
+        for j in (i + 1)..nsamp {
+            let d = h_mat[row0 + j] as f64;
+            unsafe {
+                *base.add(i * nsamp + j) = d;
+                *base.add(j * nsamp + i) = d;
             }
         }
     }
