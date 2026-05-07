@@ -4,6 +4,7 @@
 //! This version:
 //! - Keeps the existing unweighted tile kernel.
 //! - Uses a weighted normalized CUDA path based on diagonal distance stripes and branch batches.
+//! - Avoids sparse atomics and avoids per-rectangular-tile row-map rebuild/copy.
 //! - Uses the min-sum identity:
 //!     den(i,j) = sample_sum[i] + sample_sum[j]
 //!     d(i,j) = 1 - 2 * sum_v(len[v] * min(p[v,i], p[v,j])) / den(i,j)
@@ -329,7 +330,7 @@ pub fn unifrac_striped_weighted_gpu(
     }
 
     info!(
-        "GPU(weighted diagonal-bitset-warp): nsamp={} embed_blk={} nblk={} diag_stripes={} visible_gpus={} using_gpus={:?}",
+        "GPU(weighted diagonal-bitset): nsamp={} embed_blk={} nblk={} diag_stripes={} visible_gpus={} using_gpus={:?}",
         nsamp,
         blk,
         nblk,
@@ -402,7 +403,7 @@ pub fn unifrac_striped_weighted_gpu(
         .collect();
 
     info!(
-        "GPU(weighted diagonal-bitset-warp): precomputed {} embedding stripes in {} ms",
+        "GPU(weighted diagonal-bitset): precomputed {} embedding stripes in {} ms",
         nblk,
         t_stripes.elapsed().as_millis()
     );
@@ -458,7 +459,7 @@ pub fn unifrac_striped_weighted_gpu(
         .clamp(64, 16384);
 
     info!(
-        "GPU(weighted diagonal-bitset-warp): shared-min branches={} skipped_single_sample_branches={} branch_batch={}",
+        "GPU(weighted diagonal-bitset): shared-min branches={} skipped_single_sample_branches={} branch_batch={}",
         active_nodes.len(),
         skipped_singletons,
         branch_batch
@@ -548,22 +549,13 @@ pub fn unifrac_striped_weighted_gpu(
 
         let cur_i32 = cur as i32;
         let words_i32 = words_per_sample as i32;
-
-        // Warp-per-sample-pair accumulation:
-        //   blockDim.x = 32 lanes, blockDim.y = number of independent pairs per block.
-        // Each warp cooperatively intersects the two sample bitsets for one pair.
-        let warps_per_block: u32 = std::env::var("UNIFRAC_CUDA_WARPS_PER_BLOCK")
-            .ok()
-            .and_then(|x| x.parse::<u32>().ok())
-            .unwrap_or(8)
-            .clamp(1, 16);
         let cfg = LaunchConfig {
             grid_dim: (
-                nsamp as u32,
-                ((diag_count + warps_per_block - 1) / warps_per_block),
+                ((nsamp as u32 + block_x - 1) / block_x),
+                ((diag_count + block_y - 1) / block_y),
                 1,
             ),
-            block_dim: (32, warps_per_block, 1),
+            block_dim: (block_x, block_y, 1),
             shared_mem_bytes: 0,
         };
 
@@ -579,7 +571,7 @@ pub fn unifrac_striped_weighted_gpu(
 
         if batch_id == 1 || batch_id == nbatches || (batch_id & 7) == 0 {
             info!(
-                "GPU(weighted diagonal-bitset-warp): processed branch batch {}/{} ({} branches, {} bitset words/sample)",
+                "GPU(weighted diagonal-bitset): processed branch batch {}/{} ({} branches, {} bitset words/sample)",
                 batch_id,
                 nbatches,
                 cur,
@@ -589,7 +581,7 @@ pub fn unifrac_striped_weighted_gpu(
     }
 
     info!(
-        "GPU(weighted diagonal-bitset-warp): accumulated branch batches in {} ms",
+        "GPU(weighted diagonal-bitset): accumulated branch batches in {} ms",
         t_batches.elapsed().as_millis()
     );
 
@@ -617,11 +609,11 @@ pub fn unifrac_striped_weighted_gpu(
     drop(h_mat);
 
     info!(
-        "GPU(weighted diagonal-bitset-warp): copied/scattered output in {} ms",
+        "GPU(weighted diagonal-bitset): copied/scattered output in {} ms",
         t_copy.elapsed().as_millis()
     );
     info!(
-        "GPU(weighted diagonal-bitset-warp): total wall time {} ms",
+        "GPU(weighted diagonal-bitset): total wall time {} ms",
         t_all.elapsed().as_millis()
     );
 
@@ -751,13 +743,10 @@ void unifrac_weighted_diag_accum_minsum_bitset_f32(
     int n,
     float* __restrict__ shared              // [n * n], upper triangle accumulated min-sum
 ){
-    // One warp computes one sample pair (k,l).  Lanes split the bitset words.
-    // blockDim.x must be 32.  blockDim.y is the number of independent pairs per block.
-    int lane = (int)threadIdx.x;             // 0..31
-    int k = (int)blockIdx.x;
+    int k = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     int d = (int)(blockIdx.y * blockDim.y + threadIdx.y) + 1;
+    if (k >= n || d >= n) return;
 
-    if (lane >= 32 || k >= n || d >= n) return;
     int l = k + d;
     if (l >= n) return;
 
@@ -765,9 +754,7 @@ void unifrac_weighted_diag_accum_minsum_bitset_f32(
     const unsigned long long* ml = masks + (size_t)l * (size_t)words_per_sample;
 
     float acc = 0.0f;
-
-    // Each lane handles words lane, lane+32, lane+64, ...
-    for (int w = lane; w < words_per_sample; w += 32) {
+    for (int w = 0; w < words_per_sample; ++w) {
         unsigned long long common = mk[w] & ml[w];
         while (common != 0ULL) {
             int bit = __ffsll((long long)common) - 1;
@@ -779,6 +766,8 @@ void unifrac_weighted_diag_accum_minsum_bitset_f32(
                     float a = emb[base + (size_t)k];
                     float b = emb[base + (size_t)l];
                     float m = a < b ? a : b;
+                    // Since r is in the intersection bitset, m should be >0;
+                    // keep the check for numerical/defensive safety.
                     if (m > 0.0f) acc += len * m;
                 }
             }
@@ -786,17 +775,7 @@ void unifrac_weighted_diag_accum_minsum_bitset_f32(
         }
     }
 
-    // Warp reduction.  Only lane 0 writes the pair result.
-    unsigned int mask = 0xffffffffu;
-    acc += __shfl_down_sync(mask, acc, 16);
-    acc += __shfl_down_sync(mask, acc, 8);
-    acc += __shfl_down_sync(mask, acc, 4);
-    acc += __shfl_down_sync(mask, acc, 2);
-    acc += __shfl_down_sync(mask, acc, 1);
-
-    if (lane == 0) {
-        shared[(size_t)k * (size_t)n + (size_t)l] += acc;
-    }
+    shared[(size_t)k * (size_t)n + (size_t)l] += acc;
 }
 
 extern "C" __global__
