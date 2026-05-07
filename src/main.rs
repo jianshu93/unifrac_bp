@@ -789,118 +789,6 @@ fn add_const_to_row_simd<const LANES: usize>(buf: &mut [f64], add: f64, start: u
     }
 }
 
-fn compute_weighted_branch_sums(
-    row2leaf: &[Option<usize>],
-    leaf_ids: &[usize],
-    parent: &[usize],
-    lens: &[f32],
-    mode: WeightedMode,
-    nsamp: usize,
-    col_sums: &[f64],
-    raw_counts: bool,
-) -> Vec<f64> {
-    let t0 = Instant::now();
-
-    let mut branch_sums = vec![0.0f64; nsamp];
-
-    match mode {
-        WeightedMode::Dense { counts } => {
-            for (r, lopt) in row2leaf.iter().enumerate() {
-                let Some(lp) = *lopt else { continue };
-                let v_leaf = leaf_ids[lp];
-
-                for s in 0..nsamp {
-                    let val = counts[r][s];
-                    if val <= 0.0 {
-                        continue;
-                    }
-
-                    let inc = if raw_counts {
-                        val
-                    } else {
-                        let denom = col_sums[s];
-                        if denom <= 0.0 {
-                            continue;
-                        }
-                        val / denom
-                    };
-
-                    let mut v = v_leaf;
-                    loop {
-                        let len = lens[v] as f64;
-                        if len > 0.0 {
-                            branch_sums[s] += len * inc;
-                        }
-
-                        let p = parent[v];
-                        if p == usize::MAX {
-                            break;
-                        }
-                        v = p;
-                    }
-                }
-            }
-        }
-
-        WeightedMode::Csr {
-            indptr,
-            indices,
-            data,
-        } => {
-            for r in 0..row2leaf.len() {
-                let Some(lp) = row2leaf[r] else { continue };
-                let v_leaf = leaf_ids[lp];
-
-                let a = indptr[r] as usize;
-                let b = indptr[r + 1] as usize;
-
-                for k in a..b {
-                    let s = indices[k] as usize;
-                    if s >= nsamp {
-                        continue;
-                    }
-
-                    let val = data[k];
-                    if val <= 0.0 {
-                        continue;
-                    }
-
-                    let inc = if raw_counts {
-                        val
-                    } else {
-                        let denom = col_sums[s];
-                        if denom <= 0.0 {
-                            continue;
-                        }
-                        val / denom
-                    };
-
-                    let mut v = v_leaf;
-                    loop {
-                        let len = lens[v] as f64;
-                        if len > 0.0 {
-                            branch_sums[s] += len * inc;
-                        }
-
-                        let p = parent[v];
-                        if p == usize::MAX {
-                            break;
-                        }
-                        v = p;
-                    }
-                }
-            }
-        }
-    }
-
-    log::info!(
-        "weighted branch_sums precompute done in {} ms",
-        t0.elapsed().as_millis()
-    );
-
-    branch_sums
-}
-
 fn unifrac_striped_par_weighted(
     _post: &[usize],
     kids: &[Vec<usize>],
@@ -912,11 +800,8 @@ fn unifrac_striped_par_weighted(
     col_sums: &[f64],
     raw_counts: bool,
 ) -> Vec<f64> {
-    let t_total = Instant::now();
-
-    let total = lens.len();
-
     // parent[]
+    let total = lens.len();
     let parent: Vec<usize> = {
         let mut p = vec![usize::MAX; total];
         for v in 0..total {
@@ -927,34 +812,14 @@ fn unifrac_striped_par_weighted(
         p
     };
 
-    let branch_sums = compute_weighted_branch_sums(
-        row2leaf,
-        leaf_ids,
-        &parent,
-        lens,
-        mode,
-        nsamp,
-        col_sums,
-        raw_counts,
-    );
-
     // block geometry
     let n_threads = rayon::current_num_threads().max(1);
     let est_blk = ((nsamp as f64 / (2.0 * n_threads as f64)).sqrt()) as usize;
     let blk = est_blk.clamp(64, 512).next_power_of_two();
     let nblk = (nsamp + blk - 1) / blk;
 
-    log::info!(
-        "block geometry (weighted min-sum): blk={}, nblk={}, threads={}",
-        blk,
-        nblk,
-        n_threads
-    );
-
     let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
     let base_addr: usize = dist.as_ptr() as usize;
-
-    let t_pass = Instant::now();
 
     for bi in 0..nblk {
         let i0 = bi * blk;
@@ -963,32 +828,10 @@ fn unifrac_striped_par_weighted(
 
         let stripe_i = match &mode {
             WeightedMode::Dense { counts } => build_stripe_dense(
-                counts,
-                row2leaf,
-                leaf_ids,
-                &parent,
-                col_sums,
-                i0,
-                i1,
-                total,
-                raw_counts,
+                counts, row2leaf, leaf_ids, &parent, col_sums, i0, i1, total, raw_counts // NEW
             ),
-            WeightedMode::Csr {
-                indptr,
-                indices,
-                data,
-            } => build_stripe_csr(
-                indptr,
-                indices,
-                data,
-                row2leaf,
-                leaf_ids,
-                &parent,
-                col_sums,
-                i0,
-                i1,
-                total,
-                raw_counts,
+            WeightedMode::Csr { indptr, indices, data } => build_stripe_csr(
+                indptr, indices, data, row2leaf, leaf_ids, &parent, col_sums, i0, i1, total, raw_counts // NEW
             ),
         };
 
@@ -997,7 +840,6 @@ fn unifrac_striped_par_weighted(
         let row2leaf_ref = row2leaf;
         let leaf_ids_ref = leaf_ids;
         let col_sums_ref = col_sums;
-        let branch_sums_ref = &branch_sums;
         let stripe_i_ref = &stripe_i;
 
         (bi..nblk).into_par_iter().for_each(move |bj| {
@@ -1015,110 +857,93 @@ fn unifrac_striped_par_weighted(
             } else {
                 match mode_c {
                     WeightedMode::Dense { counts } => build_stripe_dense(
-                        counts,
-                        row2leaf_ref,
-                        leaf_ids_ref,
-                        parent_ref,
-                        col_sums_ref,
-                        j0,
-                        j1,
-                        total,
-                        raw_counts,
+                        counts, row2leaf_ref, leaf_ids_ref, parent_ref, col_sums_ref, j0, j1, total, raw_counts
                     ),
-                    WeightedMode::Csr {
-                        indptr,
-                        indices,
-                        data,
-                    } => build_stripe_csr(
-                        indptr,
-                        indices,
-                        data,
-                        row2leaf_ref,
-                        leaf_ids_ref,
-                        parent_ref,
-                        col_sums_ref,
-                        j0,
-                        j1,
-                        total,
-                        raw_counts,
+                    WeightedMode::Csr { indptr, indices, data } => build_stripe_csr(
+                        indptr, indices, data, row2leaf_ref, leaf_ids_ref, parent_ref, col_sums_ref, j0, j1, total, raw_counts
                     ),
                 }
             };
 
-            // shared_min = Σ_v len[v] * min(a_v_i, a_v_j)
-            let mut shared_min = vec![0.0f64; bw * bh];
+            // num = Σ_i ℓ_i |a_i - b_i|,  den = Σ_i ℓ_i (a_i + b_i)
+            let mut num = vec![0.0f64; bw * bh];
+            let mut den = vec![0.0f64; bw * bh];
 
+            // (A) row baseline: add len*ai across row (to both num & den)
+            for &v in &stripe_i_ref.nodes {
+                let len = lens[v] as f64;
+                if len <= 0.0 { continue; }
+                let ri = stripe_i_ref.index[v] as usize;
+                let ai = &stripe_i_ref.rows[ri];
+                let nz_i = &stripe_i_ref.nz[ri];
+
+                for &ii in nz_i {
+                    let a = len * (ai[ii] as f64);
+                    if a == 0.0 { continue; }
+                    let start_j = if diagonal_block { ii + 1 } else { 0 };
+                    let row_n = &mut num[ii * bh..(ii + 1) * bh];
+                    let row_d = &mut den[ii * bh..(ii + 1) * bh];
+                    add_const_to_row_simd::<8>(row_n, a, start_j);
+                    add_const_to_row_simd::<8>(row_d, a, start_j);
+                }
+            }
+
+            // (B) column baseline: add len*aj down column (to both num & den)
+            for &v in &stripe_j.nodes {
+                let len = lens[v] as f64;
+                if len <= 0.0 { continue; }
+                let rj = stripe_j.index[v] as usize;
+                let aj = &stripe_j.rows[rj];
+                let nz_j = &stripe_j.nz[rj];
+
+                for &jj in nz_j {
+                    let add = len * (aj[jj] as f64);
+                    if add == 0.0 { continue; }
+                    let ii_end = if diagonal_block { ((j0 + jj).saturating_sub(i0)).min(bw) } else { bw };
+                    let mut ii = 0usize;
+                    while ii < ii_end {
+                        let idx = ii * bh + jj;
+                        num[idx] += add;
+                        den[idx] += add;
+                        ii += 1;
+                    }
+                }
+            }
+
+            // (C) intersection correction: num -= 2*len*min(ai,aj); den unchanged
             for &v in &stripe_i_ref.nodes {
                 let j_idx = stripe_j.index[v];
-                if j_idx == u32::MAX {
-                    continue;
-                }
-
-                let len = lens[v] as f64;
-                if len <= 0.0 {
-                    continue;
-                }
-
+                if j_idx == u32::MAX { continue; }
+                let len2 = 2.0 * (lens[v] as f64);
+                if len2 == 0.0 { continue; }
                 let ri = stripe_i_ref.index[v] as usize;
                 let rj = j_idx as usize;
-
                 let ai = &stripe_i_ref.rows[ri];
                 let aj = &stripe_j.rows[rj];
-
                 let nz_i = &stripe_i_ref.nz[ri];
                 let nz_j = &stripe_j.nz[rj];
 
                 for &ii in nz_i {
                     let gi = i0 + ii;
-                    let a = ai[ii] as f64;
-                    if a <= 0.0 {
-                        continue;
-                    }
-
                     for &jj in nz_j {
                         let gj = j0 + jj;
-                        if diagonal_block && gj <= gi {
-                            continue;
-                        }
-
-                        let b = aj[jj] as f64;
-                        if b <= 0.0 {
-                            continue;
-                        }
-
-                        shared_min[ii * bh + jj] += len * a.min(b);
+                        if diagonal_block && gj <= gi { continue; }
+                        let m = (ai[ii] as f64).min(aj[jj] as f64);
+                        num[ii * bh + jj] -= len2 * m;
                     }
                 }
             }
 
+            // write back normalized value
             unsafe {
                 let base = base_addr as *mut f64;
-
                 for ii in 0..bw {
                     let i = i0 + ii;
-
                     for jj in 0..bh {
                         let j = j0 + jj;
-
-                        if j <= i {
-                            continue;
-                        }
-
+                        if j <= i { continue; }
                         let idx = ii * bh + jj;
-                        let den = branch_sums_ref[i] + branch_sums_ref[j];
-
-                        let d = if den > 0.0 {
-                            let v = 1.0 - (2.0 * shared_min[idx] / den);
-
-                            if v < 0.0 && v > -1e-12 {
-                                0.0
-                            } else {
-                                v
-                            }
-                        } else {
-                            0.0
-                        };
-
+                        let d = if den[idx] > 0.0 { num[idx] / den[idx] } else { 0.0 };
                         *base.add(i * nsamp + j) = d;
                         *base.add(j * nsamp + i) = d;
                     }
@@ -1127,19 +952,8 @@ fn unifrac_striped_par_weighted(
         });
     }
 
-    log::info!(
-        "weighted min-sum sparse block pass done in {} ms",
-        t_pass.elapsed().as_millis()
-    );
-
-    log::info!(
-        "weighted min-sum total done in {} ms",
-        t_total.elapsed().as_millis()
-    );
-
     Arc::try_unwrap(dist).unwrap()
 }
-
 
 fn unifrac_striped_par_generalized(
     _post: &[usize],
