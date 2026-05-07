@@ -509,16 +509,15 @@ pub fn unifrac_striped_weighted_gpu(
                         let only_upper_i32 = if bi == bj { 1i32 } else { 0i32 };
 
                         // Baseline A: each nonzero entry in stripe_i contributes len*a
-                        // across a row of the tile.
+                        // across a row of the tile. Use a 1-D grid-stride kernel so very
+                        // large nnz does not overflow CUDA's grid.y limit.
                         if dsi.nnz > 0 {
                             let nnz_a_i32 = dsi.nnz as i32;
+                            let total_ops_a = (dsi.nnz as u64) * (bh as u64);
+                            let blocks = (((total_ops_a + 255) / 256).min(65_535)) as u32;
                             let cfg = LaunchConfig {
-                                grid_dim: (
-                                    ((bh as u32 + opts.block_dim_x - 1) / opts.block_dim_x),
-                                    ((dsi.nnz as u32 + opts.block_dim_y - 1) / opts.block_dim_y),
-                                    1,
-                                ),
-                                block_dim: (opts.block_dim_x, opts.block_dim_y, 1),
+                                grid_dim: (blocks, 1, 1),
+                                block_dim: (256, 1, 1),
                                 shared_mem_bytes: 0,
                             };
                             let mut launch = stream.launch_builder(&f_base_a);
@@ -533,22 +532,21 @@ pub fn unifrac_striped_weighted_gpu(
                             launch.arg(&i0_i32);
                             launch.arg(&j0_i32);
                             launch.arg(&only_upper_i32);
+                            launch.arg(&total_ops_a);
                             launch.arg(&mut d_num);
                             launch.arg(&mut d_den);
                             unsafe { launch.launch(cfg) }?;
                         }
 
                         // Baseline B: each nonzero entry in stripe_j contributes len*b
-                        // down a column of the tile.
+                        // down a column of the tile. Also uses 1-D grid-stride launch.
                         if dsj.nnz > 0 {
                             let nnz_b_i32 = dsj.nnz as i32;
+                            let total_ops_b = (dsj.nnz as u64) * (bw as u64);
+                            let blocks = (((total_ops_b + 255) / 256).min(65_535)) as u32;
                             let cfg = LaunchConfig {
-                                grid_dim: (
-                                    ((bw as u32 + opts.block_dim_x - 1) / opts.block_dim_x),
-                                    ((dsj.nnz as u32 + opts.block_dim_y - 1) / opts.block_dim_y),
-                                    1,
-                                ),
-                                block_dim: (opts.block_dim_x, opts.block_dim_y, 1),
+                                grid_dim: (blocks, 1, 1),
+                                block_dim: (256, 1, 1),
                                 shared_mem_bytes: 0,
                             };
                             let mut launch = stream.launch_builder(&f_base_b);
@@ -563,6 +561,7 @@ pub fn unifrac_striped_weighted_gpu(
                             launch.arg(&i0_i32);
                             launch.arg(&j0_i32);
                             launch.arg(&only_upper_i32);
+                            launch.arg(&total_ops_b);
                             launch.arg(&mut d_num);
                             launch.arg(&mut d_den);
                             unsafe { launch.launch(cfg) }?;
@@ -587,16 +586,17 @@ pub fn unifrac_striped_weighted_gpu(
                         if !corr_idx.is_empty() {
                             let d_corr_idx: CudaSlice<u32> = stream.clone_htod(corr_idx.as_slice())?;
                             let d_corr_val: CudaSlice<f32> = stream.clone_htod(corr_val.as_slice())?;
-                            let n_corr_i32 = corr_idx.len() as i32;
+                            let n_corr_u64 = corr_idx.len() as u64;
+                            let blocks = (((n_corr_u64 + 255) / 256).min(65_535)) as u32;
                             let cfg = LaunchConfig {
-                                grid_dim: ((corr_idx.len() as u32 + 255) / 256, 1, 1),
+                                grid_dim: (blocks, 1, 1),
                                 block_dim: (256, 1, 1),
                                 shared_mem_bytes: 0,
                             };
                             let mut launch = stream.launch_builder(&f_corr);
                             launch.arg(&d_corr_idx);
                             launch.arg(&d_corr_val);
-                            launch.arg(&n_corr_i32);
+                            launch.arg(&n_corr_u64);
                             launch.arg(&mut d_num);
                             unsafe { launch.launch(cfg) }?;
                         }
@@ -726,29 +726,35 @@ void weighted_sparse_baseline_a(
     int i0,
     int j0,
     int only_upper,
+    unsigned long long total_ops,
     float* __restrict__ num,
     float* __restrict__ den
 ){
-    int jj = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int e  = (int)(blockIdx.y * blockDim.y + threadIdx.y);
-    if (jj >= bh || e >= nnz) return;
+    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
 
-    unsigned int row = nz_rows[e];
-    int ii = (int)nz_cols[e];
-    int gi = i0 + ii;
-    int gj = j0 + jj;
-    if (only_upper && gj <= gi) return;
+    for (unsigned long long op = tid; op < total_ops; op += stride) {
+        int jj = (int)(op % (unsigned long long)bh);
+        int e  = (int)(op / (unsigned long long)bh);
+        if (e >= nnz) continue;
 
-    unsigned int nid = nodes[row];
-    float len = lens_all[(size_t)nid];
-    if (len <= 0.0f) return;
+        unsigned int row = nz_rows[e];
+        int ii = (int)nz_cols[e];
+        int gi = i0 + ii;
+        int gj = j0 + jj;
+        if (only_upper && gj <= gi) continue;
 
-    float add = len * nz_vals[e];
-    if (add == 0.0f) return;
+        unsigned int nid = nodes[row];
+        float len = lens_all[(size_t)nid];
+        if (len <= 0.0f) continue;
 
-    size_t idx = (size_t)ii * (size_t)bh + (size_t)jj;
-    atomicAdd(&num[idx], add);
-    atomicAdd(&den[idx], add);
+        float add = len * nz_vals[e];
+        if (add == 0.0f) continue;
+
+        size_t idx = (size_t)ii * (size_t)bh + (size_t)jj;
+        atomicAdd(&num[idx], add);
+        atomicAdd(&den[idx], add);
+    }
 }
 
 extern "C" __global__
@@ -764,41 +770,49 @@ void weighted_sparse_baseline_b(
     int i0,
     int j0,
     int only_upper,
+    unsigned long long total_ops,
     float* __restrict__ num,
     float* __restrict__ den
 ){
-    int ii = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int e  = (int)(blockIdx.y * blockDim.y + threadIdx.y);
-    if (ii >= bw || e >= nnz) return;
+    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
 
-    unsigned int row = nz_rows[e];
-    int jj = (int)nz_cols[e];
-    int gi = i0 + ii;
-    int gj = j0 + jj;
-    if (only_upper && gj <= gi) return;
+    for (unsigned long long op = tid; op < total_ops; op += stride) {
+        int ii = (int)(op % (unsigned long long)bw);
+        int e  = (int)(op / (unsigned long long)bw);
+        if (e >= nnz) continue;
 
-    unsigned int nid = nodes[row];
-    float len = lens_all[(size_t)nid];
-    if (len <= 0.0f) return;
+        unsigned int row = nz_rows[e];
+        int jj = (int)nz_cols[e];
+        int gi = i0 + ii;
+        int gj = j0 + jj;
+        if (only_upper && gj <= gi) continue;
 
-    float add = len * nz_vals[e];
-    if (add == 0.0f) return;
+        unsigned int nid = nodes[row];
+        float len = lens_all[(size_t)nid];
+        if (len <= 0.0f) continue;
 
-    size_t idx = (size_t)ii * (size_t)bh + (size_t)jj;
-    atomicAdd(&num[idx], add);
-    atomicAdd(&den[idx], add);
+        float add = len * nz_vals[e];
+        if (add == 0.0f) continue;
+
+        size_t idx = (size_t)ii * (size_t)bh + (size_t)jj;
+        atomicAdd(&num[idx], add);
+        atomicAdd(&den[idx], add);
+    }
 }
 
 extern "C" __global__
 void weighted_sparse_correction(
     const unsigned int* __restrict__ corr_idx,
     const float* __restrict__ corr_val,
-    int n_corr,
+    unsigned long long n_corr,
     float* __restrict__ num
 ){
-    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    if (tid >= n_corr) return;
-    atomicAdd(&num[(size_t)corr_idx[tid]], -corr_val[tid]);
+    unsigned long long tid = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    for (unsigned long long k = tid; k < n_corr; k += stride) {
+        atomicAdd(&num[(size_t)corr_idx[k]], -corr_val[k]);
+    }
 }
 
 extern "C" __global__
