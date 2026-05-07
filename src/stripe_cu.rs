@@ -264,7 +264,7 @@ pub fn unifrac_striped_unweighted_gpu(
     Ok(Arc::try_unwrap(dist).unwrap())
 }
 
-// ------------------------- Public API: Weighted GPU (normalized only) -------------------------
+// Public API: Weighted GPU (normalized only)
 
 pub fn unifrac_striped_weighted_gpu(
     kids: &[Vec<usize>],
@@ -619,7 +619,7 @@ pub fn unifrac_striped_weighted_gpu(
     Ok(Arc::try_unwrap(dist).unwrap())
 }
 
-// ------------------------- CUDA kernels -------------------------
+// CUDA kernels 
 
 const KERNEL_SRC: &str = r#"
 extern "C" __global__
@@ -737,7 +737,7 @@ void unifrac_weighted_tile_idxmap_f32(
 }
 "#;
 
-// ------------------------- GPU selection -------------------------
+// GPU selection
 
 fn auto_gpu_count(visible: usize, tiles: usize) -> usize {
     if visible == 0 {
@@ -775,7 +775,7 @@ fn pick_devices(opts: &GpuOptions, tiles: usize) -> Result<Vec<usize>> {
     Ok((0..use_n).collect())
 }
 
-// ------------------------- Scatter helpers -------------------------
+// Scatter helpers
 
 #[inline(always)]
 unsafe fn see_scatter_tile_to_host(
@@ -804,7 +804,7 @@ unsafe fn see_scatter_tile_to_host(
     }
 }
 
-// ------------------------- Bit helpers (unweighted) -------------------------
+// Bit helpers (unweighted) 
 
 fn merge_union_sorted_usize(a: &[usize], b: &[usize]) -> Vec<usize> {
     let mut out = Vec::with_capacity(a.len() + b.len());
@@ -868,7 +868,7 @@ fn extract_words_into(raw: &[u64], start_bit: usize, len_bits: usize, dst: &mut 
     }
 }
 
-// ------------------------- Unweighted CPU phase 1/2 -------------------------
+// Unweighted CPU phase 1/2 
 
 fn build_unweighted_node_bits_and_active(
     post: &[usize],
@@ -1004,7 +1004,7 @@ fn build_unweighted_node_bits_and_active(
     Ok((node_bits, active_per_strip, blk))
 }
 
-// ------------------------- Weighted stripe building (compact) -------------------------
+// Weighted stripe building (compact) 
 
 #[derive(Clone)]
 struct Stripe {
@@ -1175,7 +1175,7 @@ fn sort_stripe_compact(
     }
 }
 
-// ------------------------- NEW: union builder into existing Vec (no alloc) -------------------------
+// union builder into existing Vec (no alloc)
 
 #[inline]
 fn merge_union_u32_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
