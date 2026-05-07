@@ -799,6 +799,8 @@ fn compute_weighted_branch_sums(
     col_sums: &[f64],
     raw_counts: bool,
 ) -> Vec<f64> {
+    let t0 = Instant::now();
+
     let mut branch_sums = vec![0.0f64; nsamp];
 
     match mode {
@@ -891,6 +893,11 @@ fn compute_weighted_branch_sums(
         }
     }
 
+    log::info!(
+        "weighted branch_sums precompute done in {} ms",
+        t0.elapsed().as_millis()
+    );
+
     branch_sums
 }
 
@@ -905,6 +912,8 @@ fn unifrac_striped_par_weighted(
     col_sums: &[f64],
     raw_counts: bool,
 ) -> Vec<f64> {
+    let t_total = Instant::now();
+
     let total = lens.len();
 
     // parent[]
@@ -918,16 +927,6 @@ fn unifrac_striped_par_weighted(
         p
     };
 
-    // Precompute denominator contribution for each sample:
-    //
-    // branch_sums[s] = Σ_v len[v] * abundance_on_branch(v, s)
-    //
-    // Then for any pair:
-    //
-    // den(i,j) = branch_sums[i] + branch_sums[j]
-    //
-    // This is valid for both normalized weighted UniFrac and raw-count weighted
-    // UniFrac, as long as the same abundances are used in the shared-min term.
     let branch_sums = compute_weighted_branch_sums(
         row2leaf,
         leaf_ids,
@@ -945,8 +944,17 @@ fn unifrac_striped_par_weighted(
     let blk = est_blk.clamp(64, 512).next_power_of_two();
     let nblk = (nsamp + blk - 1) / blk;
 
+    log::info!(
+        "block geometry (weighted min-sum): blk={}, nblk={}, threads={}",
+        blk,
+        nblk,
+        n_threads
+    );
+
     let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
     let base_addr: usize = dist.as_ptr() as usize;
+
+    let t_pass = Instant::now();
 
     for bi in 0..nblk {
         let i0 = bi * blk;
@@ -1038,10 +1046,6 @@ fn unifrac_striped_par_weighted(
             };
 
             // shared_min = Σ_v len[v] * min(a_v_i, a_v_j)
-            //
-            // We only need branches present in both stripes. Branches present
-            // in only one stripe have min(a,b)=0 and are already represented
-            // in branch_sums[i] + branch_sums[j].
             let mut shared_min = vec![0.0f64; bw * bh];
 
             for &v in &stripe_i_ref.nodes {
@@ -1082,8 +1086,7 @@ fn unifrac_striped_par_weighted(
                             continue;
                         }
 
-                        let m = if a < b { a } else { b };
-                        shared_min[ii * bh + jj] += len * m;
+                        shared_min[ii * bh + jj] += len * a.min(b);
                     }
                 }
             }
@@ -1107,7 +1110,6 @@ fn unifrac_striped_par_weighted(
                         let d = if den > 0.0 {
                             let v = 1.0 - (2.0 * shared_min[idx] / den);
 
-                            // Avoid tiny negative values from floating-point roundoff.
                             if v < 0.0 && v > -1e-12 {
                                 0.0
                             } else {
@@ -1125,8 +1127,19 @@ fn unifrac_striped_par_weighted(
         });
     }
 
+    log::info!(
+        "weighted min-sum sparse block pass done in {} ms",
+        t_pass.elapsed().as_millis()
+    );
+
+    log::info!(
+        "weighted min-sum total done in {} ms",
+        t_total.elapsed().as_millis()
+    );
+
     Arc::try_unwrap(dist).unwrap()
 }
+
 
 fn unifrac_striped_par_generalized(
     _post: &[usize],
