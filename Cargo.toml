@@ -38,4 +38,4 @@ default = []
 
 stdsimd = []
 
-gpu = ["dep:cudarc"]
+cuda = ["dep:cudarc"]

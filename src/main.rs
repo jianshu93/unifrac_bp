@@ -43,11 +43,11 @@ use succparen::{
 use std::simd::{LaneCount, Simd, SupportedLaneCount};
 
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda")]
 mod stripe_cu;
 
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda")]
 use crate::stripe_cu::{
     GpuOptions,
     InputTable,
@@ -56,11 +56,11 @@ use crate::stripe_cu::{
 };
 
 fn gpu_available() -> bool {
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     {
         stripe_cu::device_count().unwrap_or(0) > 0
     }
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(feature = "cuda"))]
     {
         false
     }
@@ -1481,7 +1481,7 @@ fn main() -> Result<()> {
     log::info!("logger initialized from default environment");
 
     let m = Command::new("unifrac-rs")
-        .version("0.2.2")
+        .version("0.3.1")
         .about("Striped UniFrac via Optimal Balanced Parenthesis")
         .after_help(UNIFRAC_CITATIONS)
         .after_long_help(UNIFRAC_CITATIONS)
@@ -1590,10 +1590,10 @@ fn main() -> Result<()> {
 
     let use_gpu = gpu_available();
 
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "cuda")]
     let gpu_opts = GpuOptions {
         devices: Vec::new(),   // empty => stripe_cu.rs auto-picks how many GPUs to use
-        block_rows: 512,
+        block_rows: 1024,
         block_dim_x: 16,
         block_dim_y: 16,
     };
@@ -1854,7 +1854,7 @@ fn main() -> Result<()> {
             };
 
             if use_gpu && !raw_counts {
-                #[cfg(feature = "gpu")]
+                #[cfg(feature = "cuda")]
                 {
                     let table = InputTable::DenseCounts(&counts);
                     unifrac_striped_weighted_gpu(
@@ -1868,7 +1868,7 @@ fn main() -> Result<()> {
                         gpu_opts.clone(),
                     )?
                 }
-                #[cfg(not(feature = "gpu"))]
+                #[cfg(not(feature = "cuda"))]
                 {
                     unreachable!()
                 }
@@ -1899,7 +1899,7 @@ fn main() -> Result<()> {
             };
 
             if use_gpu && !raw_counts {
-                #[cfg(feature = "gpu")]
+                #[cfg(feature = "cuda")]
                 {
                     let table = InputTable::Csr {
                         indptr: &indptr,
@@ -1917,7 +1917,7 @@ fn main() -> Result<()> {
                         gpu_opts.clone(),
                     )?
                 }
-                #[cfg(not(feature = "gpu"))]
+                #[cfg(not(feature = "cuda"))]
                 {
                     unreachable!()
                 }
@@ -1968,7 +1968,7 @@ fn main() -> Result<()> {
             }
         }
         if use_gpu {
-            #[cfg(feature = "gpu")]
+            #[cfg(feature = "cuda")]
             {
                 unifrac_striped_unweighted_gpu(
                     &post,
@@ -1979,7 +1979,7 @@ fn main() -> Result<()> {
                     gpu_opts.clone(),
                 )?
             }
-            #[cfg(not(feature = "gpu"))]
+            #[cfg(not(feature = "cuda"))]
             {
                 unreachable!()
             }

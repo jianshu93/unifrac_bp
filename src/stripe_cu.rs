@@ -10,7 +10,7 @@
 //! - No per-tile stream.synchronize() (we keep the old blocking memcpy_dtoh behavior).
 //!
 //! NOTE:
-//! - Requires `--features gpu` and `cudarc`.
+//! - Requires `--features cuda` and `cudarc`.
 //! - Weighted assumes normalized abundances (alpha=1).
 
 use anyhow::{bail, Context, Result};
@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-// ------------------------- Small helper for raw output ptr -------------------------
+// Small helper for raw output ptr
 
 #[derive(Clone, Copy)]
 struct DistPtr(NonNull<f64>);
@@ -41,7 +41,7 @@ impl DistPtr {
 unsafe impl Send for DistPtr {}
 unsafe impl Sync for DistPtr {}
 
-// ------------------------- Options / Inputs -------------------------
+// Options / Inputs 
 
 #[derive(Clone, Debug)]
 pub struct GpuOptions {
@@ -75,7 +75,7 @@ pub enum InputTable<'a> {
     },
 }
 
-// ------------------------- Public API: Unweighted GPU -------------------------
+// Public API: Unweighted GPU
 
 pub fn unifrac_striped_unweighted_gpu(
     post: &[usize],
@@ -301,6 +301,8 @@ pub fn unifrac_striped_weighted_gpu(
         p
     };
 
+    // Larger blocks reduce per-tile launch/copy overhead. The caller can still
+    // set this through GpuOptions.
     let blk = opts
         .block_rows
         .max(1)
@@ -309,18 +311,21 @@ pub fn unifrac_striped_weighted_gpu(
         .clamp(64, 4096);
     let nblk = (nsamp + blk - 1) / blk;
 
-    let tiles_count = nblk * (nblk + 1) / 2;
-    let devices = pick_devices(&opts, tiles_count)?;
+    let pairs: Vec<(usize, usize)> = (0..nblk)
+        .flat_map(|bi| (bi..nblk).map(move |bj| (bi, bj)))
+        .collect();
+
+    let devices = pick_devices(&opts, pairs.len())?;
     if devices.is_empty() {
         bail!("GPU requested but no CUDA devices available");
     }
 
     info!(
-        "GPU(weighted): nsamp={} blk={} nblk={} tiles={} visible_gpus={} using_gpus={:?}",
+        "GPU(weighted sparse): nsamp={} blk={} nblk={} tiles={} visible_gpus={} using_gpus={:?}",
         nsamp,
         blk,
         nblk,
-        tiles_count,
+        pairs.len(),
         device_count().unwrap_or(0),
         devices
     );
@@ -328,20 +333,15 @@ pub fn unifrac_striped_weighted_gpu(
     let dist = Arc::new(vec![0.0f64; nsamp * nsamp]);
     let out_ptr = DistPtr(unsafe { NonNull::new_unchecked(dist.as_ptr() as *mut f64) });
 
-    // Compile PTX once
     let ptx = Arc::new(compile_ptx(KERNEL_SRC).context("nvrtc compile PTX")?);
 
-    // Share table
+    // Share table.
     let dense_counts: Option<Arc<Vec<Vec<f64>>>> = match table {
         InputTable::DenseCounts(c) => Some(Arc::new(c.to_vec())),
         _ => None,
     };
     let csr_pack: Option<(Arc<Vec<u32>>, Arc<Vec<u32>>, Arc<Vec<f64>>)> = match table {
-        InputTable::Csr {
-            indptr,
-            indices,
-            data,
-        } => Some((
+        InputTable::Csr { indptr, indices, data } => Some((
             Arc::new(indptr.to_vec()),
             Arc::new(indices.to_vec()),
             Arc::new(data.to_vec()),
@@ -352,60 +352,43 @@ pub fn unifrac_striped_weighted_gpu(
         bail!("invalid table mode");
     }
 
-    // Share read-only
     let parent = Arc::new(parent);
     let leaf_ids = Arc::new(leaf_ids.to_vec());
     let row2leaf = Arc::new(row2leaf.to_vec());
     let col_sums = Arc::new(col_sums.to_vec());
     let lens_f32 = Arc::new(lens.to_vec());
+    let pairs = Arc::new(pairs);
 
-    // Precompute stripes (old fast compact representation)
+    // Precompute sparse stripes on the host. Each stripe keeps dense rows only
+    // long enough to derive nz_offsets/nz_cols/nz_vals; the GPU path uses the
+    // sparse fields.
     let t_stripes = Instant::now();
     let stripes: Vec<Stripe> = (0..nblk)
         .into_par_iter()
         .map(|bi| {
             let s0 = bi * blk;
             let s1 = ((bi + 1) * blk).min(nsamp);
-
             match (&dense_counts, &csr_pack) {
                 (Some(c), _) => build_stripe_dense_compact(
-                    c,
-                    &row2leaf,
-                    &leaf_ids,
-                    &parent,
-                    &col_sums,
-                    s0,
-                    s1,
-                    total,
+                    c, &row2leaf, &leaf_ids, &parent, &col_sums, s0, s1, total,
                 ),
                 (_, Some((ip, idx, dat))) => build_stripe_csr_compact(
-                    ip,
-                    idx,
-                    dat,
-                    &row2leaf,
-                    &leaf_ids,
-                    &parent,
-                    &col_sums,
-                    s0,
-                    s1,
-                    total,
+                    ip, idx, dat, &row2leaf, &leaf_ids, &parent, &col_sums, s0, s1, total,
                 ),
                 _ => unreachable!(),
             }
         })
         .collect();
 
+    let total_nnz: usize = stripes.iter().map(|s| s.nz_vals.len()).sum();
     info!(
-        "GPU(weighted): precomputed {} stripes in {} ms",
+        "GPU(weighted sparse): precomputed {} stripes, total sparse entries={} in {} ms",
         nblk,
+        total_nnz,
         t_stripes.elapsed().as_millis()
     );
 
     let stripes = Arc::new(stripes);
-
-    // Precompute global max nodes to bound worst-case union sizing per worker
-    let global_max_nodes = stripes.iter().map(|s| s.nodes.len()).max().unwrap_or(0);
-
     let ng = devices.len();
 
     thread::scope(|scope| {
@@ -414,6 +397,7 @@ pub fn unifrac_striped_weighted_gpu(
             let lens_f32 = Arc::clone(&lens_f32);
             let ptx = Arc::clone(&ptx);
             let out_ptr = out_ptr;
+            let pairs = Arc::clone(&pairs);
 
             scope.spawn(move || {
                 let inner = || -> Result<()> {
@@ -421,183 +405,225 @@ pub fn unifrac_striped_weighted_gpu(
                     let stream = ctx.default_stream();
 
                     let module = ctx.load_module((*ptx).clone())?;
-                    let f_w = module
-                        .load_function("unifrac_weighted_tile_idxmap_f32")
-                        .context("load kernel unifrac_weighted_tile_idxmap_f32")?;
+                    let f_zero = module
+                        .load_function("zero_tile_f32")
+                        .context("load kernel zero_tile_f32")?;
+                    let f_base_a = module
+                        .load_function("weighted_sparse_baseline_a")
+                        .context("load kernel weighted_sparse_baseline_a")?;
+                    let f_base_b = module
+                        .load_function("weighted_sparse_baseline_b")
+                        .context("load kernel weighted_sparse_baseline_b")?;
+                    let f_corr = module
+                        .load_function("weighted_sparse_correction")
+                        .context("load kernel weighted_sparse_correction")?;
+                    let f_norm = module
+                        .load_function("weighted_sparse_normalize")
+                        .context("load kernel weighted_sparse_normalize")?;
 
-                    // Upload lens once
                     let d_lens_all: CudaSlice<f32> = stream.clone_htod(lens_f32.as_slice())?;
 
-                    // Tile output buffer (reused)
+                    struct DeviceStripe {
+                        d_nodes: CudaSlice<u32>,
+                        d_nz_rows: CudaSlice<u32>,
+                        d_nz_cols: CudaSlice<u32>,
+                        d_nz_vals: CudaSlice<f32>,
+                        nnz: usize,
+                        width: usize,
+                    }
+
+                    // Upload every sparse stripe once per worker/GPU. This removes the
+                    // repeated dense stripe row uploads from the previous kernel.
+                    let mut d_stripes: Vec<DeviceStripe> = Vec::with_capacity(stripes.len());
+                    for s in stripes.iter() {
+                        let nodes_src: Vec<u32> = if s.nodes.is_empty() { vec![0] } else { s.nodes.clone() };
+                        let rows_src: Vec<u32> = if s.nz_rows.is_empty() { vec![0] } else { s.nz_rows.clone() };
+                        let cols_src: Vec<u32> = if s.nz_cols.is_empty() { vec![0] } else { s.nz_cols.clone() };
+                        let vals_src: Vec<f32> = if s.nz_vals.is_empty() { vec![0.0] } else { s.nz_vals.clone() };
+                        d_stripes.push(DeviceStripe {
+                            d_nodes: stream.clone_htod(nodes_src.as_slice())?,
+                            d_nz_rows: stream.clone_htod(rows_src.as_slice())?,
+                            d_nz_cols: stream.clone_htod(cols_src.as_slice())?,
+                            d_nz_vals: stream.clone_htod(vals_src.as_slice())?,
+                            nnz: s.nz_vals.len(),
+                            width: s.width,
+                        });
+                    }
+
                     let max_elems = blk * blk;
+                    let mut d_num: CudaSlice<f32> = stream.alloc_zeros(max_elems)?;
+                    let mut d_den: CudaSlice<f32> = stream.alloc_zeros(max_elems)?;
                     let mut d_out: CudaSlice<f32> = stream.alloc_zeros(max_elems)?;
                     let mut h_out = vec![0.0f32; max_elems];
 
-                    // Cache uploaded stripe rows (device) for i/j
-                    // rows is compact row-major: [nrows * width]
-                    let mut cached_i: Option<(usize, CudaSlice<f32>, usize)> = None; // (bi, d_rows, width)
-                    let mut cached_j: Option<(usize, CudaSlice<f32>, usize)> = None; // (bj, d_rows, width)
-
-                    // ---- NEW: reusable device buffers for union + maps (no per-tile allocations) ----
-                    //
-                    // Bound worst-case union size for THIS worker.
-                    // Worker owns bi where bi % ng == widx, and it pairs those bi with all bj >= bi.
-                    let mut worker_max_nodes_i = 0usize;
-                    for bi in 0..nblk {
-                        if bi % ng == widx {
-                            worker_max_nodes_i = worker_max_nodes_i.max(stripes[bi].nodes.len());
-                        }
-                    }
-                    // Worst union <= max_i + global_max_nodes
-                    let max_union = worker_max_nodes_i + global_max_nodes;
-                    let max_union = max_union.max(1);
-
-                    let mut d_union: CudaSlice<u32> = stream.alloc_zeros(max_union)?;
-                    let mut d_map_i: CudaSlice<i32> = stream.alloc_zeros(max_union)?;
-                    let mut d_map_j: CudaSlice<i32> = stream.alloc_zeros(max_union)?;
-
-                    // Host buffers reused too (avoid per-tile Vec alloc churn)
-                    let mut h_union: Vec<u32> = Vec::with_capacity(max_union);
-                    let mut h_map_i: Vec<i32> = Vec::with_capacity(max_union);
-                    let mut h_map_j: Vec<i32> = Vec::with_capacity(max_union);
+                    let mut corr_idx: Vec<u32> = Vec::new();
+                    let mut corr_val: Vec<f32> = Vec::new();
 
                     let mut tiles_done = 0usize;
-                    let mut tiles_total = 0usize;
-                    for bi in (0..nblk).filter(|bi| bi % ng == widx) {
-                        tiles_total += nblk - bi;
-                    }
+                    let tiles_total = pairs
+                        .iter()
+                        .enumerate()
+                        .filter(|(tix, _)| tix % ng == widx)
+                        .count();
 
-                    for bi in (0..nblk).filter(|bi| bi % ng == widx) {
-                        let stripe_i = &stripes[bi];
-                        let bw = stripe_i.width;
-                        if bw == 0 {
+                    for (tix, &(bi, bj)) in pairs.iter().enumerate() {
+                        if tix % ng != widx {
                             continue;
                         }
 
-                        // Upload stripe_i rows once (cached)
-                        let d_rows_i_ref = match &cached_i {
-                            Some((cbi, d, w)) if *cbi == bi && *w == bw => d,
-                            _ => {
-                                let d: CudaSlice<f32> = stream.clone_htod(stripe_i.rows.as_slice())?;
-                                cached_i = Some((bi, d, bw));
-                                &cached_i.as_ref().unwrap().1
-                            }
+                        let stripe_i = &stripes[bi];
+                        let stripe_j = &stripes[bj];
+                        let dsi = &d_stripes[bi];
+                        let dsj = &d_stripes[bj];
+
+                        let i0 = bi * blk;
+                        let i1 = ((bi + 1) * blk).min(nsamp);
+                        let j0 = bj * blk;
+                        let j1 = ((bj + 1) * blk).min(nsamp);
+
+                        let bw = i1 - i0;
+                        let bh = j1 - j0;
+                        if bw == 0 || bh == 0 {
+                            continue;
+                        }
+                        debug_assert_eq!(bw, dsi.width);
+                        debug_assert_eq!(bh, dsj.width);
+
+                        let elems_i32 = (bw * bh) as i32;
+                        let zero_cfg = LaunchConfig {
+                            grid_dim: (((bw * bh) as u32 + 255) / 256, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
                         };
+                        let mut launch = stream.launch_builder(&f_zero);
+                        launch.arg(&mut d_num);
+                        launch.arg(&mut d_den);
+                        launch.arg(&mut d_out);
+                        launch.arg(&elems_i32);
+                        unsafe { launch.launch(zero_cfg) }?;
 
-                        for bj in bi..nblk {
-                            let stripe_j = &stripes[bj];
-                            let bh = stripe_j.width;
-                            if bh == 0 {
-                                continue;
-                            }
+                        let bw_i32 = bw as i32;
+                        let bh_i32 = bh as i32;
+                        let i0_i32 = i0 as i32;
+                        let j0_i32 = j0 as i32;
+                        let only_upper_i32 = if bi == bj { 1i32 } else { 0i32 };
 
-                            // Upload stripe_j rows once per bj (cached)
-                            let d_rows_j_ref = match &cached_j {
-                                Some((cbj, d, w)) if *cbj == bj && *w == bh => d,
-                                _ => {
-                                    let d: CudaSlice<f32> = stream.clone_htod(stripe_j.rows.as_slice())?;
-                                    cached_j = Some((bj, d, bh));
-                                    &cached_j.as_ref().unwrap().1
-                                }
-                            };
-
-                            // Build union + maps into reusable host buffers (no allocations)
-                            h_union.clear();
-                            h_map_i.clear();
-                            h_map_j.clear();
-
-                            // Merge sorted node lists (both are sorted ascending)
-                            // Then map via index[] (O(1)).
-                            merge_union_u32_into(&stripe_i.nodes, &stripe_j.nodes, &mut h_union);
-
-                            if h_union.is_empty() {
-                                tiles_done += 1;
-                                continue;
-                            }
-                            if h_union.len() > max_union {
-                                bail!(
-                                    "internal: union len {} > max_union {} (dev={}, worker={})",
-                                    h_union.len(),
-                                    max_union,
-                                    dev_id,
-                                    widx
-                                );
-                            }
-
-                            for &nid in &h_union {
-                                let v = nid as usize;
-                                let ri = stripe_i.index[v];
-                                let rj = stripe_j.index[v];
-                                h_map_i.push(if ri == u32::MAX { -1 } else { ri as i32 });
-                                h_map_j.push(if rj == u32::MAX { -1 } else { rj as i32 });
-                            }
-
-                            // Reuse device buffers: memcpy_htod into existing allocations.
-                            //
-                            // IMPORTANT: this assumes cudarc's memcpy_htod supports src.len() <= dst.len()
-                            // (it does in practice for 0.18.x; it copies the provided slice).
-                            stream.memcpy_htod(&h_union, &mut d_union)?;
-                            stream.memcpy_htod(&h_map_i, &mut d_map_i)?;
-                            stream.memcpy_htod(&h_map_j, &mut d_map_j)?;
-
-                            let i0 = bi * blk;
-                            let i1 = ((bi + 1) * blk).min(nsamp);
-                            let j0 = bj * blk;
-                            let j1 = ((bj + 1) * blk).min(nsamp);
-
-                            let bw_eff = i1 - i0;
-                            let bh_eff = j1 - j0;
-                            debug_assert_eq!(bw_eff, bw);
-                            debug_assert_eq!(bh_eff, bh);
-
-                            let num_union_i32 = h_union.len() as i32;
-                            let bw_i32 = bw as i32;
-                            let bh_i32 = bh as i32;
-                            let i0_i32 = i0 as i32;
-                            let j0_i32 = j0 as i32;
-                            let only_upper_i32 = if bi == bj { 1i32 } else { 0i32 };
-
+                        // Baseline A: each nonzero entry in stripe_i contributes len*a
+                        // across a row of the tile.
+                        if dsi.nnz > 0 {
+                            let nnz_a_i32 = dsi.nnz as i32;
                             let cfg = LaunchConfig {
                                 grid_dim: (
                                     ((bh as u32 + opts.block_dim_x - 1) / opts.block_dim_x),
-                                    ((bw as u32 + opts.block_dim_y - 1) / opts.block_dim_y),
+                                    ((dsi.nnz as u32 + opts.block_dim_y - 1) / opts.block_dim_y),
                                     1,
                                 ),
                                 block_dim: (opts.block_dim_x, opts.block_dim_y, 1),
                                 shared_mem_bytes: 0,
                             };
-
-                            let mut launch = stream.launch_builder(&f_w);
-                            launch.arg(d_rows_i_ref);
-                            launch.arg(d_rows_j_ref);
+                            let mut launch = stream.launch_builder(&f_base_a);
+                            launch.arg(&dsi.d_nodes);
+                            launch.arg(&dsi.d_nz_rows);
+                            launch.arg(&dsi.d_nz_cols);
+                            launch.arg(&dsi.d_nz_vals);
                             launch.arg(&d_lens_all);
-                            launch.arg(&d_union);
-                            launch.arg(&d_map_i);
-                            launch.arg(&d_map_j);
-                            launch.arg(&num_union_i32);
+                            launch.arg(&nnz_a_i32);
                             launch.arg(&bw_i32);
                             launch.arg(&bh_i32);
                             launch.arg(&i0_i32);
                             launch.arg(&j0_i32);
                             launch.arg(&only_upper_i32);
-                            launch.arg(&mut d_out);
-
+                            launch.arg(&mut d_num);
+                            launch.arg(&mut d_den);
                             unsafe { launch.launch(cfg) }?;
+                        }
 
-                            // Old behavior: blocking DtoH per tile; no explicit synchronize()
-                            stream.memcpy_dtoh(&d_out, &mut h_out)?;
+                        // Baseline B: each nonzero entry in stripe_j contributes len*b
+                        // down a column of the tile.
+                        if dsj.nnz > 0 {
+                            let nnz_b_i32 = dsj.nnz as i32;
+                            let cfg = LaunchConfig {
+                                grid_dim: (
+                                    ((bw as u32 + opts.block_dim_x - 1) / opts.block_dim_x),
+                                    ((dsj.nnz as u32 + opts.block_dim_y - 1) / opts.block_dim_y),
+                                    1,
+                                ),
+                                block_dim: (opts.block_dim_x, opts.block_dim_y, 1),
+                                shared_mem_bytes: 0,
+                            };
+                            let mut launch = stream.launch_builder(&f_base_b);
+                            launch.arg(&dsj.d_nodes);
+                            launch.arg(&dsj.d_nz_rows);
+                            launch.arg(&dsj.d_nz_cols);
+                            launch.arg(&dsj.d_nz_vals);
+                            launch.arg(&d_lens_all);
+                            launch.arg(&nnz_b_i32);
+                            launch.arg(&bw_i32);
+                            launch.arg(&bh_i32);
+                            launch.arg(&i0_i32);
+                            launch.arg(&j0_i32);
+                            launch.arg(&only_upper_i32);
+                            launch.arg(&mut d_num);
+                            launch.arg(&mut d_den);
+                            unsafe { launch.launch(cfg) }?;
+                        }
 
-                            unsafe {
-                                see_scatter_tile_to_host(out_ptr, &h_out, nsamp, i0, j0, bw, bh);
-                            }
+                        // Sparse intersection correction. Build only actual nz×nz
+                        // intersections for branches present in both stripes.
+                        corr_idx.clear();
+                        corr_val.clear();
+                        build_weighted_correction_pairs(
+                            stripe_i,
+                            stripe_j,
+                            &lens_f32,
+                            i0,
+                            j0,
+                            bi == bj,
+                            bh,
+                            &mut corr_idx,
+                            &mut corr_val,
+                        );
 
-                            tiles_done += 1;
-                            if (tiles_done & 127) == 0 {
-                                info!(
-                                    "GPU(weighted): dev={} worker={} progress {}/{} tiles",
-                                    dev_id, widx, tiles_done, tiles_total
-                                );
-                            }
+                        if !corr_idx.is_empty() {
+                            let d_corr_idx: CudaSlice<u32> = stream.clone_htod(corr_idx.as_slice())?;
+                            let d_corr_val: CudaSlice<f32> = stream.clone_htod(corr_val.as_slice())?;
+                            let n_corr_i32 = corr_idx.len() as i32;
+                            let cfg = LaunchConfig {
+                                grid_dim: ((corr_idx.len() as u32 + 255) / 256, 1, 1),
+                                block_dim: (256, 1, 1),
+                                shared_mem_bytes: 0,
+                            };
+                            let mut launch = stream.launch_builder(&f_corr);
+                            launch.arg(&d_corr_idx);
+                            launch.arg(&d_corr_val);
+                            launch.arg(&n_corr_i32);
+                            launch.arg(&mut d_num);
+                            unsafe { launch.launch(cfg) }?;
+                        }
+
+                        let cfg = LaunchConfig {
+                            grid_dim: (((bw * bh) as u32 + 255) / 256, 1, 1),
+                            block_dim: (256, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        let mut launch = stream.launch_builder(&f_norm);
+                        launch.arg(&d_num);
+                        launch.arg(&d_den);
+                        launch.arg(&elems_i32);
+                        launch.arg(&mut d_out);
+                        unsafe { launch.launch(cfg) }?;
+
+                        stream.memcpy_dtoh(&d_out, &mut h_out)?;
+                        unsafe {
+                            see_scatter_tile_to_host(out_ptr, &h_out, nsamp, i0, j0, bw, bh);
+                        }
+
+                        tiles_done += 1;
+                        if (tiles_done & 63) == 0 {
+                            info!(
+                                "GPU(weighted sparse): dev={} worker={} progress {}/{} tiles",
+                                dev_id, widx, tiles_done, tiles_total
+                            );
                         }
                     }
 
@@ -612,7 +638,7 @@ pub fn unifrac_striped_weighted_gpu(
     });
 
     info!(
-        "GPU(weighted): total wall time {} ms",
+        "GPU(weighted sparse): total wall time {} ms",
         t_all.elapsed().as_millis()
     );
 
@@ -679,61 +705,114 @@ void unifrac_unweighted_tile_u64(
 }
 
 extern "C" __global__
-void unifrac_weighted_tile_idxmap_f32(
-    const float* __restrict__ rowsA,
-    const float* __restrict__ rowsB,
+void zero_tile_f32(float* num, float* den, float* out, int elems) {
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= elems) return;
+    num[tid] = 0.0f;
+    den[tid] = 0.0f;
+    out[tid] = 0.0f;
+}
+
+extern "C" __global__
+void weighted_sparse_baseline_a(
+    const unsigned int* __restrict__ nodes,
+    const unsigned int* __restrict__ nz_rows,
+    const unsigned int* __restrict__ nz_cols,
+    const float* __restrict__ nz_vals,
     const float* __restrict__ lens_all,
-    const unsigned int* __restrict__ nodes_u,
-    const int* __restrict__ mapA,
-    const int* __restrict__ mapB,
-    int num_union,
+    int nnz,
     int bw,
     int bh,
     int i0,
     int j0,
     int only_upper,
-    float* __restrict__ out
+    float* __restrict__ num,
+    float* __restrict__ den
 ){
     int jj = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    int ii = (int)(blockIdx.y * blockDim.y + threadIdx.y);
-    if (ii >= bw || jj >= bh) return;
+    int e  = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (jj >= bh || e >= nnz) return;
 
+    unsigned int row = nz_rows[e];
+    int ii = (int)nz_cols[e];
     int gi = i0 + ii;
     int gj = j0 + jj;
-
     if (only_upper && gj <= gi) return;
-    if (gi == gj) return;
 
-    float num = 0.0f;
-    float den = 0.0f;
+    unsigned int nid = nodes[row];
+    float len = lens_all[(size_t)nid];
+    if (len <= 0.0f) return;
 
-    for (int k = 0; k < num_union; ++k) {
-        unsigned int nid = nodes_u[k];
-        float len = lens_all[(size_t)nid];
-        if (len <= 0.0f) continue;
+    float add = len * nz_vals[e];
+    if (add == 0.0f) return;
 
-        int ra = mapA[k];
-        int rb = mapB[k];
+    size_t idx = (size_t)ii * (size_t)bh + (size_t)jj;
+    atomicAdd(&num[idx], add);
+    atomicAdd(&den[idx], add);
+}
 
-        float a = 0.0f;
-        float b = 0.0f;
+extern "C" __global__
+void weighted_sparse_baseline_b(
+    const unsigned int* __restrict__ nodes,
+    const unsigned int* __restrict__ nz_rows,
+    const unsigned int* __restrict__ nz_cols,
+    const float* __restrict__ nz_vals,
+    const float* __restrict__ lens_all,
+    int nnz,
+    int bw,
+    int bh,
+    int i0,
+    int j0,
+    int only_upper,
+    float* __restrict__ num,
+    float* __restrict__ den
+){
+    int ii = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int e  = (int)(blockIdx.y * blockDim.y + threadIdx.y);
+    if (ii >= bw || e >= nnz) return;
 
-        if (ra >= 0) a = rowsA[(size_t)ra * (size_t)bw + (size_t)ii];
-        if (rb >= 0) b = rowsB[(size_t)rb * (size_t)bh + (size_t)jj];
+    unsigned int row = nz_rows[e];
+    int jj = (int)nz_cols[e];
+    int gi = i0 + ii;
+    int gj = j0 + jj;
+    if (only_upper && gj <= gi) return;
 
-        float s = a + b;
-        if (s <= 0.0f) continue;
+    unsigned int nid = nodes[row];
+    float len = lens_all[(size_t)nid];
+    if (len <= 0.0f) return;
 
-        float diff = a - b;
-        if (diff < 0.0f) diff = -diff;
+    float add = len * nz_vals[e];
+    if (add == 0.0f) return;
 
-        den += len * s;
-        num += len * diff;
-    }
+    size_t idx = (size_t)ii * (size_t)bh + (size_t)jj;
+    atomicAdd(&num[idx], add);
+    atomicAdd(&den[idx], add);
+}
 
+extern "C" __global__
+void weighted_sparse_correction(
+    const unsigned int* __restrict__ corr_idx,
+    const float* __restrict__ corr_val,
+    int n_corr,
+    float* __restrict__ num
+){
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= n_corr) return;
+    atomicAdd(&num[(size_t)corr_idx[tid]], -corr_val[tid]);
+}
+
+extern "C" __global__
+void weighted_sparse_normalize(
+    const float* __restrict__ num,
+    const float* __restrict__ den,
+    int elems,
+    float* __restrict__ out
+){
+    int tid = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (tid >= elems) return;
     float d = 0.0f;
-    if (den > 0.0f) d = num / den;
-    out[(size_t)ii * (size_t)bh + (size_t)jj] = d;
+    if (den[tid] > 0.0f) d = num[tid] / den[tid];
+    out[tid] = d;
 }
 "#;
 
@@ -1008,10 +1087,14 @@ fn build_unweighted_node_bits_and_active(
 
 #[derive(Clone)]
 struct Stripe {
-    nodes: Vec<u32>, // sorted node ids
-    rows: Vec<f32>,  // row-major [nrows * width]
-    index: Vec<u32>, // len=total, maps node_id -> row index or u32::MAX
-    width: usize,    // stripe width
+    nodes: Vec<u32>,     // sorted node ids
+    rows: Vec<f32>,      // row-major [nrows * width], kept for host correction construction
+    index: Vec<u32>,     // len=total, maps node_id -> row index or u32::MAX
+    width: usize,        // stripe width
+    nz_offsets: Vec<u32>,// len = nodes.len() + 1
+    nz_rows: Vec<u32>,   // one row id per nonzero entry
+    nz_cols: Vec<u32>,   // one local sample column per nonzero entry
+    nz_vals: Vec<f32>,   // one value per nonzero entry
 }
 
 #[inline]
@@ -1167,11 +1250,94 @@ fn sort_stripe_compact(
         rows = rows_sorted;
     }
 
+    let mut nz_offsets = Vec::with_capacity(nodes.len() + 1);
+    let mut nz_rows = Vec::new();
+    let mut nz_cols = Vec::new();
+    let mut nz_vals = Vec::new();
+
+    nz_offsets.push(0);
+    for r in 0..nodes.len() {
+        let base = r * width;
+        for c in 0..width {
+            let val = rows[base + c];
+            if val > 0.0 {
+                nz_rows.push(r as u32);
+                nz_cols.push(c as u32);
+                nz_vals.push(val);
+            }
+        }
+        nz_offsets.push(nz_vals.len() as u32);
+    }
+
     Stripe {
         nodes,
         rows,
         index: idx_of,
         width,
+        nz_offsets,
+        nz_rows,
+        nz_cols,
+        nz_vals,
+    }
+}
+
+fn build_weighted_correction_pairs(
+    stripe_i: &Stripe,
+    stripe_j: &Stripe,
+    lens: &[f32],
+    i0: usize,
+    j0: usize,
+    diagonal_block: bool,
+    bh: usize,
+    corr_idx: &mut Vec<u32>,
+    corr_val: &mut Vec<f32>,
+) {
+    let mut ia = 0usize;
+    let mut ib = 0usize;
+
+    while ia < stripe_i.nodes.len() && ib < stripe_j.nodes.len() {
+        let va = stripe_i.nodes[ia];
+        let vb = stripe_j.nodes[ib];
+
+        if va < vb {
+            ia += 1;
+            continue;
+        }
+        if vb < va {
+            ib += 1;
+            continue;
+        }
+
+        let v = va as usize;
+        let len2 = 2.0f32 * lens[v];
+        if len2 > 0.0 {
+            let ai0 = stripe_i.nz_offsets[ia] as usize;
+            let ai1 = stripe_i.nz_offsets[ia + 1] as usize;
+            let bj0 = stripe_j.nz_offsets[ib] as usize;
+            let bj1 = stripe_j.nz_offsets[ib + 1] as usize;
+
+            for ea in ai0..ai1 {
+                let ii = stripe_i.nz_cols[ea] as usize;
+                let gi = i0 + ii;
+                let a = stripe_i.nz_vals[ea];
+                for eb in bj0..bj1 {
+                    let jj = stripe_j.nz_cols[eb] as usize;
+                    let gj = j0 + jj;
+                    if diagonal_block && gj <= gi {
+                        continue;
+                    }
+                    let b = stripe_j.nz_vals[eb];
+                    let m = if a < b { a } else { b };
+                    if m > 0.0 {
+                        corr_idx.push((ii * bh + jj) as u32);
+                        corr_val.push(len2 * m);
+                    }
+                }
+            }
+        }
+
+        ia += 1;
+        ib += 1;
     }
 }
 
