@@ -10,7 +10,7 @@ Striped UniFrac is the default algorithm and it is extremely fast for large numb
 Right now, the performance matches C++ version of Striped UniFrac in unifrac-binaries (https://github.com/biocore/unifrac-binaries) (CPU only). I will stop optimizatizing here because this crate was developed for benchmarking [DartUniFrac](https://github.com/jianshu93/dartunifrac.git).
 
 
-## Install
+## Install (CPU)
 ```bash
 git clone https://github.com/jianshu93/unifrac_bp
 cd unifrac_bp
@@ -19,9 +19,17 @@ cargo build --release
 ./target/release/unifrac -h
 ```
 
+
+## GPU
+
+```bash
+cargo build --release --features cuda
+
+```
+
 ## Usage 
 ```bash
-************** initializing logger *****************
+ ************** initializing logger *****************
 
 Striped UniFrac via Optimal Balanced Parenthesis
 
@@ -32,12 +40,13 @@ Options:
   -i, --input <input>      OTU/Feature table in TSV format
   -m, --biom <biom>        OTU/Feature table in BIOM (HDF5) format
       --weighted           Weighted UniFrac (normalized). Per-sample relative abundances will be used
+      --raw-sample-counts  Weighted UniFrac using raw sample counts. Applies only with --weighted. Ignored for --generalized and unweighted.
   -T, --threads <threads>  Number of threads, default all logical cores
   -o, --output <output>    Output distance matrix in TSV format [default: unifrac.tsv]
       --generalized        Generalized UniFrac
-      --alpha <alpha>      Alpha parameter for Generalized UniFrac (default 0.5). Only used with --generalized. [default: 0.5]
-      --vaw
-  -h, --help               Print help
+      --alpha <alpha>      Alpha parameter for Generalized UniFrac. Only used with --generalized. [default: 0.5]
+      --vaw                Variance-adjusted Weighted UniFrac (VAW)
+  -h, --help               Print help (see more with '--help')
   -V, --version            Print version
 ```
 
